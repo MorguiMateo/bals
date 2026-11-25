@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible};
 
 use crate::audio::AudioPipeline;
 use crate::buffer::ReplayBuffer;
@@ -46,7 +48,11 @@ pub enum EngineEvent {
 pub enum RecordingState {
     Idle,
     RecordingManual,
-    RecordingGame { exe_name: String, pid: u32 },
+    RecordingGame {
+        exe_name: String,
+        pid: u32,
+        paused_alt_tab: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -92,8 +98,11 @@ impl Drop for HighResTimerGuard {
 /// Sesión activa de grabación en Replay Buffer a tasa de cuadros constante (CFR).
 ///
 /// Solo existe mientras se graba; al cerrarse se liberan GPU, audio y el timer de 1 ms (0% GPU).
+/// Soporta pausa transparente en Alt-Tab sin perder ni sobrescribir el `ReplayBuffer` en RAM.
 struct ActiveSession {
-    capture: WgcCapture,
+    capture: Option<WgcCapture>,
+    capture_cursor: bool,
+    target_hwnd: Option<HWND>,
     converter: GpuNv12Converter,
     encoder: H264Encoder,
     audio: Option<AudioPipeline>,
@@ -101,6 +110,12 @@ struct ActiveSession {
     video_config: VideoConfig,
     /// Reloj QPC de inicio de la sesión para alinear video CFR (0, dt, 2*dt...) con el audio.
     qpc_origin_100ns: i64,
+    /// Tiempo acumulado en pausa por Alt-Tab (en ticks de 100 ns) para mantener sync A/V exacto.
+    total_paused_100ns: i64,
+    /// Timestamp QPC en el que se entró en pausa por Alt-Tab (si actualmente está pausado).
+    paused_since_100ns: Option<i64>,
+    /// Último momento en que WGC entregó un frame real (para detectar juegos congelados en Alt-Tab).
+    last_wgc_frame_at: Instant,
     /// Índice del próximo frame CFR a emitir.
     frame_index: u64,
     /// Última textura NV12 ya convertida en VRAM (se reutiliza sin repetir `VideoProcessorBlt`
@@ -162,15 +177,24 @@ impl ActiveSession {
         };
 
         let qpc_origin_100ns = clock::now_100ns();
+        let target_hwnd = match target {
+            CaptureTarget::Window(hwnd) => Some(hwnd),
+            _ => None,
+        };
 
         Ok(Self {
-            capture,
+            capture: Some(capture),
+            capture_cursor: cfg.capture_cursor,
+            target_hwnd,
             converter,
             encoder,
             audio,
             replay_buffer,
             video_config,
             qpc_origin_100ns,
+            total_paused_100ns: 0,
+            paused_since_100ns: None,
+            last_wgc_frame_at: Instant::now(),
             frame_index: 0,
             last_nv12: None,
             state,
@@ -178,9 +202,73 @@ impl ActiveSession {
         })
     }
 
+    fn is_paused(&self) -> bool {
+        self.paused_since_100ns.is_some()
+    }
+
+    /// Evalúa si el juego está minimizado o en Alt-Tab sin frames activos.
+    /// Devuelve `true` si cambió el estado de pausa (para refrescar la bandeja).
+    fn update_alt_tab_pause(&mut self, d3d: &SharedD3DDevice) -> bool {
+        let Some(hwnd) = self.target_hwnd else {
+            return false;
+        };
+
+        let is_minimized = unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() };
+        let is_foreground = unsafe { GetForegroundWindow() == hwnd };
+
+        // Si el juego está minimizado o sin foco y dejó de emitir frames (>500 ms), pausamos
+        // para NO sobrescribir el ReplayBuffer con frames congelados ni perder lo grabado.
+        let should_pause = is_minimized
+            || (!is_foreground && self.last_wgc_frame_at.elapsed() > Duration::from_millis(500));
+
+        if should_pause && self.paused_since_100ns.is_none() {
+            self.paused_since_100ns = Some(clock::now_100ns());
+            if let RecordingState::RecordingGame { paused_alt_tab, .. } = &mut self.state {
+                *paused_alt_tab = true;
+            }
+            debug!(
+                buffered_secs = format!("{:.1}", self.replay_buffer.buffered_secs()),
+                ram_mb = format!("{:.1}", self.replay_buffer.total_bytes() as f64 / (1024.0 * 1024.0)),
+                "Juego en Alt-Tab/minimizado; ReplayBuffer congelado en RAM para preservar los últimos segundos"
+            );
+            return true;
+        }
+
+        if !should_pause && self.paused_since_100ns.is_some() {
+            // Si WGC se había soltado durante el Alt-Tab (ej. fullscreen exclusivo), re-engancharlo
+            // manteniendo intacto todo el ReplayBuffer.
+            if self.capture.is_none() {
+                if let Ok(new_cap) = WgcCapture::start(d3d, CaptureTarget::Window(hwnd), self.capture_cursor) {
+                    self.capture = Some(new_cap);
+                } else {
+                    return false;
+                }
+            }
+
+            if let Some(since) = self.paused_since_100ns.take() {
+                self.total_paused_100ns += (clock::now_100ns() - since).max(0);
+            }
+            if let RecordingState::RecordingGame { paused_alt_tab, .. } = &mut self.state {
+                *paused_alt_tab = false;
+            }
+            self.encoder.force_keyframe();
+            self.last_wgc_frame_at = Instant::now();
+            debug!("Juego de vuelta en primer plano; reanudando ReplayBuffer sin pérdida");
+            return true;
+        }
+
+        false
+    }
+
     fn pump_audio(&mut self) {
         if let Some(audio) = &self.audio {
-            while let Ok(apkt) = audio.rx.try_recv() {
+            while let Ok(mut apkt) = audio.rx.try_recv() {
+                // Mientras está en pausa por Alt-Tab, descartamos audio nuevo para conservar
+                // intacto el audio de la jugada previa en el ReplayBuffer.
+                if self.is_paused() {
+                    continue;
+                }
+                apkt.pts_100ns = apkt.pts_100ns.saturating_sub(self.total_paused_100ns);
                 self.replay_buffer.push_audio(apkt);
             }
         }
@@ -188,26 +276,41 @@ impl ActiveSession {
 
     /// Espera con precisión de sub-milisegundo hasta el siguiente tick CFR (60.000 / 30.000 FPS)
     /// y codifica el frame más reciente de la GPU (o reutiliza el último NV12 si la imagen no cambió).
-    fn step_cfr_tick(&mut self) -> Result<()> {
+    fn step_cfr_tick(&mut self, d3d: &SharedD3DDevice) -> Result<bool> {
+        let pause_changed = self.update_alt_tab_pause(d3d);
+
+        // Si está pausado por Alt-Tab, dormimos livianamente (0% GPU) sin tocar el ReplayBuffer.
+        if self.is_paused() {
+            // Revisar si WGC recibió un frame nuevo (p. ej. juego en segundo monitor volvió a renderizar).
+            if let Some(cap) = &self.capture {
+                if let Some(fresh) = cap.take_latest() {
+                    self.last_wgc_frame_at = Instant::now();
+                    if let Ok(nv12) = self.converter.convert(&fresh.texture, fresh.width, fresh.height) {
+                        self.last_nv12 = Some(nv12);
+                    }
+                    return Ok(self.update_alt_tab_pause(d3d) || pause_changed);
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+            return Ok(pause_changed);
+        }
+
         let fps = self.video_config.fps.as_u32() as i64;
         let target_rel_100ns = (self.frame_index as i64 * 10_000_000) / fps;
-        let target_qpc = self.qpc_origin_100ns + target_rel_100ns;
+        let target_wall_qpc = self.qpc_origin_100ns + self.total_paused_100ns + target_rel_100ns;
 
         // Espera híbrida: sleep de 1 ms mientras falte >1.5 ms, luego yield fino para exactitud CFR.
         loop {
             let now = clock::now_100ns();
-            let remaining = target_qpc - now;
+            let remaining = target_wall_qpc - now;
             if remaining <= 0 {
-                // Si el hilo sufrió una pausa externa (>120 ms), resincronizar índice de frame
-                // sin ráfagas de frames duplicados.
                 if remaining < -1_200_000 {
-                    let elapsed = (now - self.qpc_origin_100ns).max(0);
+                    let elapsed = (now - self.qpc_origin_100ns - self.total_paused_100ns).max(0);
                     self.frame_index = ((elapsed * fps) / 10_000_000) as u64;
                 }
                 break;
             }
             if remaining > 15_000 {
-                // > 1.5 ms
                 let sleep_ms = ((remaining - 10_000) / 10_000).clamp(1, 8) as u64;
                 thread::sleep(Duration::from_millis(sleep_ms));
             } else {
@@ -216,11 +319,21 @@ impl ActiveSession {
         }
 
         // 1. Tomar el frame más reciente del buzón WGC (si llegó uno nuevo desde el tick anterior).
-        if let Some(fresh) = self.capture.take_latest() {
-            let nv12 = self
-                .converter
-                .convert(&fresh.texture, fresh.width, fresh.height)?;
-            self.last_nv12 = Some(nv12);
+        if let Some(cap) = &self.capture {
+            if let Some(fresh) = cap.take_latest() {
+                self.last_wgc_frame_at = Instant::now();
+                match self.converter.convert(&fresh.texture, fresh.width, fresh.height) {
+                    Ok(nv12) => self.last_nv12 = Some(nv12),
+                    Err(err) => {
+                        // Error transitorio durante cambio de modo fullscreen/Alt-Tab:
+                        // no descartamos el ReplayBuffer; soltamos solo WGC para re-engancharlo.
+                        warn!("Conversión transitoria falló durante transición de ventana ({err:#}); preservando ReplayBuffer");
+                        self.capture = None;
+                        self.paused_since_100ns = Some(clock::now_100ns());
+                        return Ok(true);
+                    }
+                }
+            }
         }
 
         // 2. Codificar exactamente 1 frame CFR en este tick (si ya recibimos al menos el primer frame).
@@ -234,11 +347,10 @@ impl ActiveSession {
             }
             self.frame_index += 1;
         } else {
-            // Todavía esperando el primer frame inicial de WGC; resincronizar origen al llegar.
             self.qpc_origin_100ns = clock::now_100ns();
         }
 
-        Ok(())
+        Ok(pause_changed)
     }
 }
 
@@ -393,10 +505,14 @@ fn engine_loop(
         // 3. Ejecutar el siguiente tick CFR exacto si hay sesión activa, o dormir si estamos en reposo.
         if let Some(active) = session.as_mut() {
             active.pump_audio();
-            if let Err(err) = active.step_cfr_tick() {
-                warn!("La sesión de captura se cerró ({err:#}); pasando a reposo");
-                session = None;
-                publish_status(&session, &shared_status, &event_tx);
+            match active.step_cfr_tick(&d3d) {
+                Ok(true) => publish_status(&session, &shared_status, &event_tx),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!("La sesión de captura se cerró ({err:#}); pasando a reposo");
+                    session = None;
+                    publish_status(&session, &shared_status, &event_tx);
+                }
             }
         } else if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(200)) {
             match cmd {
@@ -468,7 +584,7 @@ fn poll_game_autodetect(
     if let Some(active) = session.as_ref() {
         match &active.state {
             RecordingState::RecordingManual => return,
-            RecordingState::RecordingGame { pid, exe_name } => {
+            RecordingState::RecordingGame { pid, exe_name, .. } => {
                 if is_process_alive(*pid) {
                     return;
                 }
@@ -502,6 +618,7 @@ fn poll_game_autodetect(
         let state = RecordingState::RecordingGame {
             exe_name: exe_name.clone(),
             pid,
+            paused_alt_tab: false,
         };
         match ActiveSession::start(d3d, cfg, CaptureTarget::Window(hwnd), audio_src, state) {
             Ok(active) => {
@@ -510,7 +627,11 @@ fn poll_game_autodetect(
             }
             Err(err) => {
                 warn!(game = %exe_name, "No se pudo enganchar ventana WGC ({err:#}); intentando monitor principal");
-                let fallback_state = RecordingState::RecordingGame { exe_name, pid };
+                let fallback_state = RecordingState::RecordingGame {
+                    exe_name,
+                    pid,
+                    paused_alt_tab: false,
+                };
                 if let Ok(active) = ActiveSession::start(
                     d3d,
                     cfg,

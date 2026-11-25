@@ -300,10 +300,23 @@ fn process_engine_events() {
                             "Bals — Grabando monitor ({} {} | tecla: {})",
                             st.cfg.resolution, st.cfg.fps, st.cfg.save_clip_hotkey
                         ),
-                        RecordingState::RecordingGame { exe_name, .. } => format!(
-                            "Bals — Grabando {exe_name} (tecla: {})",
-                            st.cfg.save_clip_hotkey
-                        ),
+                        RecordingState::RecordingGame {
+                            exe_name,
+                            paused_alt_tab,
+                            ..
+                        } => {
+                            if *paused_alt_tab {
+                                format!(
+                                    "Bals — {exe_name} en pausa (Alt-Tab · buffer intacto | tecla: {})",
+                                    st.cfg.save_clip_hotkey
+                                )
+                            } else {
+                                format!(
+                                    "Bals — Grabando {exe_name} (tecla: {})",
+                                    st.cfg.save_clip_hotkey
+                                )
+                            }
+                        }
                     };
                     update_tray_icon(st.hwnd, icon, &tip);
                 }
@@ -427,10 +440,23 @@ fn show_context_menu(hwnd: HWND) {
                     "● Grabando monitor ({:.0}s · {:.1} MB RAM)",
                     status.buffered_secs, status.buffer_ram_mb
                 ),
-                RecordingState::RecordingGame { exe_name, .. } => format!(
-                    "● {exe_name} ({:.0}s · {:.1} MB RAM)",
-                    status.buffered_secs, status.buffer_ram_mb
-                ),
+                RecordingState::RecordingGame {
+                    exe_name,
+                    paused_alt_tab,
+                    ..
+                } => {
+                    if *paused_alt_tab {
+                        format!(
+                            "⏸ {exe_name} (Alt-Tab · {:.0}s · {:.1} MB en RAM)",
+                            status.buffered_secs, status.buffer_ram_mb
+                        )
+                    } else {
+                        format!(
+                            "● {exe_name} ({:.0}s · {:.1} MB RAM)",
+                            status.buffered_secs, status.buffer_ram_mb
+                        )
+                    }
+                }
             };
             append_text(menu, MF_STRING | MF_GRAYED, 0, &header);
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());

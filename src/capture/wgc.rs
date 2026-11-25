@@ -126,7 +126,9 @@ impl WgcCapture {
                 };
 
                 let content_size = match frame.ContentSize() {
-                    Ok(s) if s.Width > 0 && s.Height > 0 => s,
+                    // Ignorar tamaños minúsculos de ventanas minimizadas (ej. 160x28 al hacer Alt-Tab)
+                    // para no romper el FramePool ni sobrescribir el ReplayBuffer.
+                    Ok(s) if s.Width >= 320 && s.Height >= 200 => s,
                     _ => return Ok(()),
                 };
 
