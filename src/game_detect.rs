@@ -50,6 +50,8 @@ pub struct DetectedGame {
     pub hwnd: HWND,
     pub pid: u32,
     pub exe_name: String,
+    /// Nombre limpio y amigable del juego para carpetas y prefijos de clips (ej. `"Valorant"`).
+    pub game_name: String,
     pub is_fullscreen: bool,
     pub monitor: HMONITOR,
 }
@@ -85,6 +87,8 @@ pub fn detect_foreground_game(extra_game_exes: &[String]) -> Option<DetectedGame
     let exe_name = process_exe_name(pid)?;
     let exe_lower = exe_name.to_ascii_lowercase();
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let win_title = window_title_text(hwnd);
+    let game_name = resolve_game_name(&exe_name, &win_title);
 
     // 1. Coincidencia explícita en la lista del usuario (funciona también en modo ventana).
     if extra_game_exes
@@ -95,6 +99,7 @@ pub fn detect_foreground_game(extra_game_exes: &[String]) -> Option<DetectedGame
             hwnd,
             pid,
             exe_name,
+            game_name,
             is_fullscreen: is_fullscreen_window(hwnd),
             monitor,
         });
@@ -111,6 +116,7 @@ pub fn detect_foreground_game(extra_game_exes: &[String]) -> Option<DetectedGame
             hwnd,
             pid,
             exe_name,
+            game_name,
             is_fullscreen: true,
             monitor,
         });
@@ -269,5 +275,135 @@ unsafe extern "system" fn enum_visible_windows_proc(hwnd: HWND, lparam: LPARAM) 
             });
 
         BOOL(1)
+    }
+}
+
+fn window_title_text(hwnd: HWND) -> String {
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; (len as usize) + 1];
+        let copied = GetWindowTextW(hwnd, &mut buf);
+        if copied <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..copied as usize])
+            .trim()
+            .to_string()
+    }
+}
+
+/// Convierte el nombre del `.exe` (y opcionalmente el título de ventana) en un nombre de juego
+/// limpio y estable para crear carpetas y prefijos de clip (ej. `"VALORANT-Win64-Shipping.exe"` → `"Valorant"`).
+pub fn resolve_game_name(exe_name: &str, window_title: &str) -> String {
+    let lower = exe_name.trim().to_ascii_lowercase();
+    let title_lower = window_title.to_ascii_lowercase();
+
+    let known = match lower.as_str() {
+        "valorant-win64-shipping.exe" | "valorant.exe" => Some("Valorant"),
+        "cs2.exe" => Some("Counter-Strike 2"),
+        "csgo.exe" => Some("CSGO"),
+        "league of legends.exe" => Some("League of Legends"),
+        "fortniteclient-win64-shipping.exe" | "fortnite.exe" => Some("Fortnite"),
+        "r5apex.exe" | "r5apex_dx12.exe" => Some("Apex Legends"),
+        "overwatch.exe" => Some("Overwatch"),
+        "rocketleague.exe" => Some("Rocket League"),
+        "gta5.exe" | "gta5_enhanced.exe" => Some("GTA V"),
+        "cod.exe" | "modernwarfare.exe" => Some("Call of Duty"),
+        "tslgame.exe" => Some("PUBG"),
+        "rainbowsix.exe" | "rainbowsix_vulkan.exe" | "rainbowsix_be.exe" => {
+            Some("Rainbow Six Siege")
+        }
+        "dota2.exe" => Some("Dota 2"),
+        "minecraft.windows.exe" => Some("Minecraft"),
+        "javaw.exe" | "java.exe" if title_lower.contains("minecraft") => Some("Minecraft"),
+        "eldenring.exe" => Some("Elden Ring"),
+        "cyberpunk2077.exe" => Some("Cyberpunk 2077"),
+        "deadbydaylight-win64-shipping.exe" => Some("Dead by Daylight"),
+        "marvel-win64-shipping.exe" => Some("Marvel Rivals"),
+        "escapefromtarkov.exe" => Some("Escape from Tarkov"),
+        "rustclient.exe" => Some("Rust"),
+        "fc24.exe" | "fc25.exe" | "fc26.exe" => Some("EA Sports FC"),
+        "genshinimpact.exe" => Some("Genshin Impact"),
+        "osu!.exe" => Some("osu"),
+        _ => None,
+    };
+
+    if let Some(name) = known {
+        return name.to_string();
+    }
+
+    // Quitar extensión `.exe` y sufijos técnicos habituales de Unreal/Unity/64-bit.
+    let mut stem = exe_name
+        .trim()
+        .strip_suffix(".exe")
+        .or_else(|| exe_name.trim().strip_suffix(".EXE"))
+        .unwrap_or(exe_name.trim())
+        .to_string();
+
+    for suffix in [
+        "-Win64-Shipping",
+        "-win64-shipping",
+        "-Win64-Test",
+        "-Shipping",
+        "_Win64",
+        "_x64",
+        "-x64",
+        "Client",
+    ] {
+        if stem.len() > suffix.len() {
+            if let Some(stripped) = stem.strip_suffix(suffix) {
+                stem = stripped.to_string();
+                break;
+            }
+        }
+    }
+
+    let cleaned = stem.replace(['_', '-'], " ");
+    let words: Vec<String> = cleaned
+        .split_whitespace()
+        .map(|w| {
+            let all_same_case =
+                w.chars().all(|c| !c.is_alphabetic() || c.is_lowercase())
+                    || w.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+            if all_same_case && w.len() > 2 {
+                let mut chars = w.chars();
+                match chars.next() {
+                    Some(first) => {
+                        format!(
+                            "{}{}",
+                            first.to_uppercase(),
+                            chars.as_str().to_lowercase()
+                        )
+                    }
+                    None => String::new(),
+                }
+            } else {
+                w.to_string()
+            }
+        })
+        .collect();
+
+    let joined = words.join(" ");
+    if joined.is_empty() {
+        "Game".to_string()
+    } else {
+        joined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_friendly_game_names() {
+        assert_eq!(resolve_game_name("VALORANT-Win64-Shipping.exe", "VALORANT"), "Valorant");
+        assert_eq!(resolve_game_name("cs2.exe", "Counter-Strike 2"), "Counter-Strike 2");
+        assert_eq!(resolve_game_name("javaw.exe", "Minecraft 1.21.4"), "Minecraft");
+        assert_eq!(resolve_game_name("palworld-win64-shipping.exe", "Palworld"), "Palworld");
+        assert_eq!(resolve_game_name("HollowKnight.exe", "Hollow Knight"), "HollowKnight");
     }
 }

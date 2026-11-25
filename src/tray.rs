@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING, NIM_ADD,
-    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
+    NIM_DELETE, NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -58,6 +59,7 @@ const IDM_DUR_60: usize = 1032;
 const IDM_DUR_120: usize = 1033;
 const IDM_TOGGLE_MIC: usize = 1040;
 const IDM_TOGGLE_FULL_AUDIO: usize = 1041;
+const IDM_TOGGLE_NOTIFICATIONS: usize = 1042;
 const IDM_OPEN_CLIPS: usize = 1050;
 const IDM_OPEN_CONFIG: usize = 1051;
 const IDM_EXIT: usize = 1099;
@@ -72,6 +74,7 @@ struct TrayState {
     event_rx: Receiver<EngineEvent>,
     status: Arc<Mutex<EngineStatus>>,
     update_check_tx: Sender<()>,
+    last_notified_clip: Option<PathBuf>,
     icon_idle: HICON,
     icon_rec: HICON,
     custom_icons: bool,
@@ -145,6 +148,7 @@ pub fn run_tray_loop(
             event_rx,
             status,
             update_check_tx,
+            last_notified_clip: None,
             icon_idle,
             icon_rec,
             custom_icons,
@@ -226,6 +230,18 @@ unsafe extern "system" fn wnd_proc(
                             let _ = st.update_check_tx.try_send(());
                         }
                     });
+                }
+                NIN_BALLOONUSERCLICK => {
+                    let clip_to_open = TRAY_STATE.with(|slot| {
+                        slot.borrow()
+                            .as_ref()
+                            .and_then(|st| st.last_notified_clip.clone())
+                    });
+                    if let Some(path) = clip_to_open {
+                        if path.exists() {
+                            open_in_shell(&path);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -362,8 +378,8 @@ unsafe extern "system" fn wnd_proc(
 
 fn process_engine_events() {
     TRAY_STATE.with(|slot| {
-        let borrow = slot.borrow();
-        let Some(st) = borrow.as_ref() else {
+        let mut borrow = slot.borrow_mut();
+        let Some(st) = borrow.as_mut() else {
             return;
         };
 
@@ -373,22 +389,31 @@ fn process_engine_events() {
                     if st.cfg.sound_feedback {
                         crate::audio::play_clip_saved_sound();
                     }
-                    let mb = stats.file_bytes as f64 / (1024.0 * 1024.0);
-                    let filename = stats
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "clip.mp4".to_string());
-                    show_balloon(
-                        st.hwnd,
-                        "Bals — Clip guardado",
-                        &format!("{filename} ({:.1} s · {:.1} MB)", stats.clip_duration_secs, mb),
-                        false,
-                        true,
-                    );
+                    st.last_notified_clip = Some(stats.path.clone());
+                    if st.cfg.show_notifications {
+                        let mb = stats.file_bytes as f64 / (1024.0 * 1024.0);
+                        let filename = stats
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "clip.mp4".to_string());
+                        show_balloon(
+                            st.hwnd,
+                            "Bals — Clip guardado",
+                            &format!(
+                                "{filename} ({:.1} s · {:.1} MB)\nClic para abrir el clip",
+                                stats.clip_duration_secs, mb
+                            ),
+                            false,
+                            true,
+                        );
+                    }
                 }
                 EngineEvent::ClipFailed(reason) => {
-                    show_balloon(st.hwnd, "Bals", &reason, true, false);
+                    st.last_notified_clip = None;
+                    if st.cfg.show_notifications {
+                        show_balloon(st.hwnd, "Bals", &reason, true, false);
+                    }
                 }
                 EngineEvent::StatusChanged(status) => {
                     refresh_tray_icon_for_status(st, &status);
@@ -484,6 +509,10 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
                 };
                 config_changed = true;
             }
+            IDM_TOGGLE_NOTIFICATIONS => {
+                st.cfg.show_notifications = !st.cfg.show_notifications;
+                config_changed = true;
+            }
             IDM_OPEN_CLIPS => {
                 let _ = std::fs::create_dir_all(&st.cfg.clips_dir);
                 open_in_shell(&st.cfg.clips_dir);
@@ -533,18 +562,18 @@ fn show_context_menu(hwnd: HWND) {
                     status.buffered_secs, status.buffer_ram_mb
                 ),
                 RecordingState::RecordingGame {
-                    exe_name,
+                    game_name,
                     paused_alt_tab,
                     ..
                 } => {
                     if *paused_alt_tab {
                         format!(
-                            "⏸ {exe_name} (Alt-Tab · {:.0}s · {:.1} MB en RAM)",
+                            "⏸ {game_name} (Alt-Tab · {:.0}s · {:.1} MB en RAM)",
                             status.buffered_secs, status.buffer_ram_mb
                         )
                     } else {
                         format!(
-                            "● {exe_name} ({:.0}s · {:.1} MB RAM)",
+                            "● {game_name} ({:.0}s · {:.1} MB RAM)",
                             status.buffered_secs, status.buffer_ram_mb
                         )
                     }
@@ -685,6 +714,12 @@ fn show_context_menu(hwnd: HWND) {
                 "Grabar audio de todo el escritorio",
             );
             append_checked(menu, st.cfg.mic_enabled, IDM_TOGGLE_MIC, "Grabar micrófono");
+            append_checked(
+                menu,
+                st.cfg.show_notifications,
+                IDM_TOGGLE_NOTIFICATIONS,
+                "Mostrar notificaciones",
+            );
 
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             append_text(menu, MF_STRING, IDM_OPEN_CLIPS, "Abrir carpeta de clips");
@@ -746,18 +781,18 @@ fn refresh_tray_icon_for_status(st: &TrayState, status: &EngineStatus) {
             st.cfg.resolution, st.cfg.fps, st.cfg.save_clip_hotkey
         ),
         RecordingState::RecordingGame {
-            exe_name,
+            game_name,
             paused_alt_tab,
             ..
         } => {
             if *paused_alt_tab {
                 format!(
-                    "Bals — {exe_name} en pausa (Alt-Tab · buffer intacto | tecla: {})",
+                    "Bals — {game_name} en pausa (Alt-Tab · buffer intacto | tecla: {})",
                     st.cfg.save_clip_hotkey
                 )
             } else {
                 format!(
-                    "Bals — Grabando {exe_name} (tecla: {})",
+                    "Bals — Grabando {game_name} (tecla: {})",
                     st.cfg.save_clip_hotkey
                 )
             }

@@ -225,7 +225,7 @@ pub fn retro_card(
         .fill(p.crt_panel_bg)
         .stroke(Stroke::new(1.5, p.crt_panel_border))
         .corner_radius(CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(11, 9));
+        .inner_margin(egui::Margin::symmetric(11, 8));
 
     frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());

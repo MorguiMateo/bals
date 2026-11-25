@@ -351,7 +351,7 @@ fn run_av_clip_test(
         .context("El buffer circular está vacío")?;
 
     let clips_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("clips");
-    let clip_path = generate_clip_path(&clips_dir);
+    let clip_path = generate_clip_path(&clips_dir, None);
 
     let stats = write_mp4_clip(&clip_path, &snapshot, video_config)?;
     info!(

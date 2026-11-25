@@ -45,6 +45,8 @@ pub(crate) enum Tab {
 pub(crate) struct ClipEntry {
     pub path: PathBuf,
     pub name: String,
+    /// Subcarpeta del juego si el clip fue clasificado por juego (ej. `Some("Valorant")`).
+    pub folder: Option<String>,
     pub size_mb: f64,
     pub modified: SystemTime,
 }
@@ -689,8 +691,8 @@ pub fn run_gui() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Bals")
             .with_icon(Arc::new(icon))
-            .with_inner_size([1080.0, 680.0])
-            .with_min_inner_size([960.0, 620.0]),
+            .with_inner_size([1080.0, 710.0])
+            .with_min_inner_size([1000.0, 700.0]),
         ..Default::default()
     };
 
@@ -734,7 +736,7 @@ impl eframe::App for BalsUiApp {
         // =========================================================================
         let top_frame = egui::Frame::new()
             .fill(p.chassis_bg)
-            .inner_margin(egui::Margin::symmetric(14, 10))
+            .inner_margin(egui::Margin::symmetric(14, 8))
             .stroke(Stroke::new(1.5, p.chassis_outline));
 
         egui::Panel::top("bals_crt_top_bezel")
@@ -852,7 +854,7 @@ impl eframe::App for BalsUiApp {
         // =========================================================================
         let bottom_frame = egui::Frame::new()
             .fill(p.chassis_bg)
-            .inner_margin(egui::Margin::symmetric(14, 8))
+            .inner_margin(egui::Margin::symmetric(14, 6))
             .stroke(Stroke::new(1.5, p.chassis_outline));
 
         egui::Panel::bottom("bals_crt_bottom_bezel")
@@ -945,7 +947,7 @@ impl eframe::App for BalsUiApp {
         // =========================================================================
         let outer_center_frame = egui::Frame::new()
             .fill(p.chassis_bg)
-            .inner_margin(egui::Margin::symmetric(14, 6));
+            .inner_margin(egui::Margin::symmetric(14, 5));
 
         egui::CentralPanel::default()
             .frame(outer_center_frame)
@@ -955,7 +957,7 @@ impl eframe::App for BalsUiApp {
 
                 let inner_frame = egui::Frame::new()
                     .fill(Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::same(12));
+                    .inner_margin(egui::Margin::same(10));
 
                 inner_frame.show(ui, |ui| {
                     match self.tab {
@@ -1152,30 +1154,59 @@ fn egui_key_to_hotkey_spec(key: egui::Key, mods: egui::Modifiers) -> Option<Stri
 }
 
 fn scan_clips(dir: &Path) -> Vec<ClipEntry> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut clips: Vec<ClipEntry> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let path = e.path();
-            if path.extension()?.to_ascii_lowercase() != "mp4" {
-                return None;
+    let mut clips = Vec::new();
+    collect_mp4_in_dir(dir, None, &mut clips);
+
+    // Escanear también 1 nivel de subcarpetas de juegos (ej. `clips/Valorant/*.mp4`).
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let sub = entry.path();
+            if sub.is_dir() {
+                let folder_name = sub
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty());
+                if folder_name.is_some() {
+                    collect_mp4_in_dir(&sub, folder_name, &mut clips);
+                }
             }
-            let meta = e.metadata().ok()?;
-            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let name = path.file_name()?.to_string_lossy().into_owned();
-            Some(ClipEntry {
-                path,
-                name,
-                size_mb: meta.len() as f64 / (1024.0 * 1024.0),
-                modified,
-            })
-        })
-        .collect();
+        }
+    }
 
     clips.sort_by(|a, b| b.modified.cmp(&a.modified));
     clips
+}
+
+fn collect_mp4_in_dir(dir: &Path, folder: Option<String>, out: &mut Vec<ClipEntry>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_mp4 = path
+            .extension()
+            .is_some_and(|e| e.to_ascii_lowercase() == "mp4");
+        if !is_mp4 {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        out.push(ClipEntry {
+            path,
+            name,
+            folder: folder.clone(),
+            size_mb: meta.len() as f64 / (1024.0 * 1024.0),
+            modified,
+        });
+    }
 }
 
 pub(crate) fn open_in_shell(path: &Path) {

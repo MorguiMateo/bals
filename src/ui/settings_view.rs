@@ -13,33 +13,29 @@ use crate::ui::widgets::{
 use crate::ui::{BalsUiApp, UpdateUiState, open_in_shell};
 use crate::updater::{CURRENT_VERSION, ReleaseInfo};
 
-/// Pestaña 1 — Dashboard estilo Consola Retro OS en grilla modular 2×2.
+/// Pestaña 1 — Dashboard estilo Consola Retro OS en grilla modular 2×2 sin scroll.
 pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            // Fila superior: VIDEO (izquierda) + AUDIO (derecha)
-            ui.columns(2, |cols| {
-                cols[0].vertical(|ui| {
-                    render_video_card(app, ui, p);
-                });
-                cols[1].vertical(|ui| {
-                    render_audio_card(app, ui, p);
-                });
-            });
-
-            ui.add_space(8.0);
-
-            // Fila inferior: CAPTURA Y ATAJO (izquierda) + SISTEMA Y TEMA (derecha)
-            ui.columns(2, |cols| {
-                cols[0].vertical(|ui| {
-                    render_capture_hotkey_card(app, ui, p);
-                });
-                cols[1].vertical(|ui| {
-                    render_system_card(app, ui, p);
-                });
-            });
+    // Fila superior: VIDEO (izquierda) + AUDIO (derecha)
+    ui.columns(2, |cols| {
+        cols[0].vertical(|ui| {
+            render_video_card(app, ui, p);
         });
+        cols[1].vertical(|ui| {
+            render_audio_card(app, ui, p);
+        });
+    });
+
+    ui.add_space(6.0);
+
+    // Fila inferior: CAPTURA Y ATAJO (izquierda) + SISTEMA Y TEMA (derecha)
+    ui.columns(2, |cols| {
+        cols[0].vertical(|ui| {
+            render_capture_hotkey_card(app, ui, p);
+        });
+        cols[1].vertical(|ui| {
+            render_system_card(app, ui, p);
+        });
+    });
 
     if app.show_exe_picker {
         render_exe_picker_modal(app, ui.ctx(), p);
@@ -79,7 +75,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            ui.add_space(3.0);
+            ui.add_space(2.0);
 
             // FPS (2 píldoras) + Calidad QVBR (3 píldoras)
             ui.label(egui::RichText::new("FPS Y CALIDAD (QVBR)").size(10.0).color(p.crt_muted));
@@ -131,7 +127,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            ui.add_space(3.0);
+            ui.add_space(2.0);
 
             // Encoder H.264 (GPU HW / CPU SW — preseleccionado automáticamente al iniciar)
             ui.label(egui::RichText::new("ENCODER H.264").size(10.0).color(p.crt_muted));
@@ -185,7 +181,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            ui.add_space(3.0);
+            ui.add_space(2.0);
 
             // Duración del Replay Buffer (4 píldoras)
             ui.label(egui::RichText::new("REPLAY BUFFER EN RAM").size(10.0).color(p.crt_muted));
@@ -547,6 +543,7 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
             ui.columns(2, |c| {
                 retro_checkbox(&mut c[0], p, &mut app.cfg.capture_cursor, "Capturar cursor");
                 retro_checkbox(&mut c[0], p, &mut app.cfg.sound_feedback, "Sonido al guardar");
+                retro_checkbox(&mut c[0], p, &mut app.cfg.show_notifications, "Notificaciones");
                 retro_checkbox(&mut c[1], p, &mut app.cfg.auto_update, "Auto-actualizar");
                 retro_checkbox(
                     &mut c[1],

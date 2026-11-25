@@ -367,6 +367,8 @@ pub struct AppConfig {
     pub mic_volume: f32,
     pub capture_cursor: bool,
     pub sound_feedback: bool,
+    /// Mostrar notificaciones de Windows al guardar un clip o avisar de errores.
+    pub show_notifications: bool,
     /// Comprobar e instalar automáticamente nuevas versiones desde GitHub Releases al iniciar.
     pub auto_update: bool,
     /// Tema visual retro de la interfaz.
@@ -397,6 +399,7 @@ impl Default for AppConfig {
             mic_volume: 1.0,
             capture_cursor: true,
             sound_feedback: true,
+            show_notifications: true,
             auto_update: true,
             ui_theme: UiTheme::CrtPhosphorGreen,
             crt_scanlines: true,

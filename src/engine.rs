@@ -66,6 +66,7 @@ pub enum RecordingState {
     },
     RecordingGame {
         exe_name: String,
+        game_name: String,
         pid: u32,
         paused_alt_tab: bool,
     },
@@ -788,6 +789,7 @@ fn poll_game_autodetect(
         hwnd,
         pid,
         exe_name,
+        game_name,
         is_fullscreen,
         monitor,
     }) = detect_foreground_game(&cfg.extra_game_exes)
@@ -800,7 +802,8 @@ fn poll_game_autodetect(
         };
 
         info!(
-            game = %exe_name,
+            game = %game_name,
+            exe = %exe_name,
             pid,
             audio_mode = ?cfg.audio_capture_mode,
             win10_dxgi = use_win10_dxgi,
@@ -815,6 +818,7 @@ fn poll_game_autodetect(
         };
         let state = RecordingState::RecordingGame {
             exe_name: exe_name.clone(),
+            game_name: game_name.clone(),
             pid,
             paused_alt_tab: false,
         };
@@ -828,7 +832,8 @@ fn poll_game_autodetect(
         ) {
             Ok(active) => {
                 info!(
-                    game = %exe_name,
+                    game = %game_name,
+                    exe = %exe_name,
                     capture = active.capture_backend,
                     encoder = %active.encoder_label,
                     "Sesión de juego iniciada"
@@ -837,9 +842,10 @@ fn poll_game_autodetect(
                 publish_status(session, cfg, shared_status, event_tx, telemetry);
             }
             Err(err) => {
-                warn!(game = %exe_name, "No se pudo enganchar captura principal ({err:#}); intentando monitor del juego");
+                warn!(game = %game_name, "No se pudo enganchar captura principal ({err:#}); intentando monitor del juego");
                 let fallback_state = RecordingState::RecordingGame {
                     exe_name,
+                    game_name,
                     pid,
                     paused_alt_tab: false,
                 };
@@ -886,7 +892,11 @@ fn handle_save_clip(
         return;
     };
 
-    let clip_path = generate_clip_path(&cfg.clips_dir);
+    let game_name = match &active.state {
+        RecordingState::RecordingGame { game_name, .. } => Some(game_name.as_str()),
+        _ => None,
+    };
+    let clip_path = generate_clip_path(&cfg.clips_dir, game_name);
     let video_config = active.video_config;
     let event_tx_clone = event_tx.clone();
     let status_clone = Arc::clone(shared_status);
@@ -946,14 +956,14 @@ fn recording_state_to_telemetry(state: &RecordingState) -> (TelemetryState, &str
             (TelemetryState::RecordingManual, monitor_label.as_str())
         }
         RecordingState::RecordingGame {
-            exe_name,
+            game_name,
             paused_alt_tab,
             ..
         } => {
             if *paused_alt_tab {
-                (TelemetryState::PausedAltTab, exe_name.as_str())
+                (TelemetryState::PausedAltTab, game_name.as_str())
             } else {
-                (TelemetryState::RecordingGame, exe_name.as_str())
+                (TelemetryState::RecordingGame, game_name.as_str())
             }
         }
     }

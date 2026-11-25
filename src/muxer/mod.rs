@@ -291,17 +291,68 @@ fn create_memory_sample(
     Ok(sample)
 }
 
-/// Genera una ruta única con fecha y hora local (`bals_YYYYMMDD_HHMMSS.mp4`).
-pub fn generate_clip_path(output_dir: &Path) -> PathBuf {
+/// Genera una ruta única con fecha y hora local:
+/// - Con juego detectado: `<output_dir>\<Juego>\<Juego>_YYYYMMDD_HHMMSS.mp4`
+/// - Modo monitor / sin juego: `<output_dir>\bals_YYYYMMDD_HHMMSS.mp4`
+pub fn generate_clip_path(output_dir: &Path, game_name: Option<&str>) -> PathBuf {
     let st = unsafe { GetLocalTime() };
-    let filename = format!(
-        "bals_{:04}{:02}{:02}_{:02}{:02}{:02}.mp4",
+    let stamp = format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
     );
-    output_dir.join(filename)
+
+    if let Some(raw_game) = game_name {
+        let folder = sanitize_folder_name(raw_game);
+        if !folder.is_empty() {
+            let prefix = folder.replace(' ', "_");
+            let filename = format!("{prefix}_{stamp}.mp4");
+            return output_dir.join(folder).join(filename);
+        }
+    }
+
+    output_dir.join(format!("bals_{stamp}.mp4"))
+}
+
+/// Sanitiza un nombre de juego para usarlo de forma segura como carpeta en Windows.
+fn sanitize_folder_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_matches(|c| c == '.' || c == ' ');
+    let limited: String = trimmed.chars().take(48).collect();
+    limited.trim().to_string()
 }
 
 #[inline]
 const fn pack_u32_pair(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generates_game_subfolder_and_prefix() {
+        let base = Path::new(r"C:\Clips");
+        let p = generate_clip_path(base, Some("Valorant"));
+        assert_eq!(p.parent().unwrap(), Path::new(r"C:\Clips\Valorant"));
+        let fname = p.file_name().unwrap().to_string_lossy();
+        assert!(fname.starts_with("Valorant_"));
+        assert!(fname.ends_with(".mp4"));
+
+        let p2 = generate_clip_path(base, Some("Counter-Strike: 2?"));
+        assert_eq!(p2.parent().unwrap(), Path::new(r"C:\Clips\Counter-Strike 2"));
+        assert!(p2.file_name().unwrap().to_string_lossy().starts_with("Counter-Strike_2_"));
+
+        let p3 = generate_clip_path(base, None);
+        assert_eq!(p3.parent().unwrap(), base);
+        assert!(p3.file_name().unwrap().to_string_lossy().starts_with("bals_"));
+    }
 }

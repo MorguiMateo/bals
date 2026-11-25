@@ -81,7 +81,13 @@ fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette
         let filtered: Vec<_> = app
             .clips
             .iter()
-            .filter(|c| filter_lower.is_empty() || c.name.to_ascii_lowercase().contains(&filter_lower))
+            .filter(|c| {
+                filter_lower.is_empty()
+                    || c.name.to_ascii_lowercase().contains(&filter_lower)
+                    || c.folder
+                        .as_ref()
+                        .is_some_and(|f| f.to_ascii_lowercase().contains(&filter_lower))
+            })
             .cloned()
             .collect();
 
@@ -167,13 +173,30 @@ fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette
 
                     let max_chars = ((rect.width() - 102.0) / 7.2).max(10.0) as usize;
                     let disp_name = truncate_middle(&clip.name, max_chars);
-                    painter.text(
-                        pos2(icon_rect.right() + 8.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        disp_name,
-                        FontId::monospace(11.5),
-                        if is_selected { p.crt_text } else { p.crt_text.linear_multiply(0.9) },
-                    );
+                    if let Some(folder) = &clip.folder {
+                        painter.text(
+                            pos2(icon_rect.right() + 8.0, rect.top() + 11.5),
+                            Align2::LEFT_CENTER,
+                            disp_name,
+                            FontId::monospace(11.2),
+                            if is_selected { p.crt_text } else { p.crt_text.linear_multiply(0.9) },
+                        );
+                        painter.text(
+                            pos2(icon_rect.right() + 8.0, rect.bottom() - 9.5),
+                            Align2::LEFT_CENTER,
+                            folder,
+                            FontId::monospace(9.8),
+                            p.amber,
+                        );
+                    } else {
+                        painter.text(
+                            pos2(icon_rect.right() + 8.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            disp_name,
+                            FontId::monospace(11.5),
+                            if is_selected { p.crt_text } else { p.crt_text.linear_multiply(0.9) },
+                        );
+                    }
 
                     if resp.clicked() {
                         clicked_path = Some(clip.path.clone());
