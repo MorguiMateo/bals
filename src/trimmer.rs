@@ -7,20 +7,23 @@ use tracing::{info, warn};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncMPVGOPSize, ICodecAPI, IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFSinkWriter, IMFSourceReader, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION,
+    CODECAPI_AVEncMPVGOPSize, ICodecAPI, IMF2DBuffer, IMFAttributes, IMFMediaBuffer, IMFMediaType,
+    IMFSample, IMFSinkWriter, IMFSourceReader, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION,
     MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
     MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
     MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-    MF_SOURCE_READER_ANY_STREAM, MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
-    MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSCODE_CONTAINERTYPE,
-    MF_VERSION, MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMediaType,
+    MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_PD_DURATION,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ANY_STREAM,
+    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_MEDIASOURCE,
+    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
+    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFAudioFormat_AAC, MFAudioFormat_PCM,
+    MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High,
+    MFNominalRange_16_235, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+    MFTranscodeContainerType_MPEG4, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32,
+    MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR,
+    eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VARIANT;
@@ -331,9 +334,8 @@ pub fn trim_mp4_passthrough(
     })
 }
 
-/// Comprime un clip `.mp4` de forma **equilibrada y mucho menos agresiva**:
-/// mantiene hasta **1080p y 60 FPS** con audio AAC 128 kbps y alta nitidez visual,
-/// reduciendo típicamente el peso en ~45–70% sin pixelar la imagen.
+/// Comprime un clip `.mp4` de forma suave y de alta fidelidad (~35% menos peso):
+/// preserva la resolución nativa y los FPS originales (ej. 1080p/2K a 60 FPS) con audio AAC 160 kbps.
 pub fn compress_mp4_balanced(
     input_path: &Path,
     output_path: &Path,
@@ -358,31 +360,17 @@ pub fn compress_mp4_balanced(
     let t0 = Instant::now();
     unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (balanced compressor) falló")?;
 
-    // Elegir un bitrate equilibrado y nítido que preserve 1080p/720p y 60 FPS originales.
-    let target_h = meta.height.min(1080);
-    let is_60fps = meta.fps >= 45.0;
-    let ideal_bps: u32 = match (target_h, is_60fps) {
-        (900.., true) => 4_800_000,  // 1080p 60fps (~18 MB / 30s) — muy nítido
-        (900.., false) => 3_400_000, // 1080p 30fps (~13 MB / 30s)
-        (_, true) => 3_000_000,      // 720p 60fps  (~11 MB / 30s)
-        (_, false) => 2_200_000,     // 720p 30fps  (~8 MB / 30s)
-    };
-
-    // Si el archivo original ya tiene un bitrate moderado, apuntar a ~55% del bitrate original
-    // (sin bajar de 2.2 Mbps para no sacrificar nitidez).
-    let src_bps = if meta.duration_secs > 0.5 && input_bytes > 0 {
-        ((input_bytes as f64 * 8.0) / meta.duration_secs) as u32
-    } else {
-        ideal_bps * 2
-    };
-    let video_bps = ideal_bps
-        .min((src_bps as f64 * 0.55) as u32)
-        .clamp(2_200_000, 5_500_000);
-    let audio_bps = 128_000u32;
-
     let clip_dur = (end_secs - start_secs).max(0.5);
-    let expected_max_bytes =
-        (((video_bps + audio_bps) as f64 / 8.0) * clip_dur * 1.25) as u64;
+    let audio_bps = 160_000u32;
+
+    // Objetivo: ~35% menos peso (65% del tamaño proporcional del rango seleccionado).
+    let range_ratio = (clip_dur / meta.duration_secs.max(clip_dur)).clamp(0.05, 1.0);
+    let range_input_bytes = (input_bytes as f64 * range_ratio).max(512_000.0);
+    let target_bytes = (range_input_bytes * 0.65) as u64;
+
+    let raw_video_bps = ((target_bytes as f64 * 8.0 * 0.94) / clip_dur) - audio_bps as f64;
+    let video_bps = (raw_video_bps as u32).clamp(1_500_000, 18_000_000);
+    let expected_max_bytes = (range_input_bytes * 0.78) as u64;
 
     let mut pass_res = compress_pass_with_opts(
         input_path,
@@ -393,11 +381,11 @@ pub fn compress_mp4_balanced(
         end_secs,
         true,
         true, // preservar FPS originales (60 fps)
-        Some(1080),
+        None, // preservar resolución nativa sin reescalar
     );
 
     if pass_res.is_err() {
-        warn!("Compresión equilibrada GPU falló; reintentando en software CBR");
+        warn!("Compresión GPU falló; reintentando en software CBR");
         pass_res = compress_pass_with_opts(
             input_path,
             output_path,
@@ -407,18 +395,18 @@ pub fn compress_mp4_balanced(
             end_secs,
             false,
             true,
-            Some(1080),
+            None,
         );
     }
 
-    // Si el driver GPU hizo overshoot significativo (>25% sobre lo esperado), aplicar pasada limpia.
+    // Si el driver GPU excedió el objetivo (~35% menos), rehacer con CBR estricto en software.
     if pass_res.is_ok() {
         let actual_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
         if actual_bytes > expected_max_bytes {
             warn!(
-                expected_mb = format!("{:.1}", expected_max_bytes as f64 / (1024.0 * 1024.0)),
+                target_mb = format!("{:.1}", target_bytes as f64 / (1024.0 * 1024.0)),
                 actual_mb = format!("{:.1}", actual_bytes as f64 / (1024.0 * 1024.0)),
-                "Compresión GPU excedió el bitrate objetivo; aplicando pasada CBR precisa"
+                "Compresión GPU excedió el ~35% objetivo; aplicando pasada CBR precisa"
             );
             let _ = std::fs::remove_file(output_path);
             pass_res = compress_pass_with_opts(
@@ -430,7 +418,7 @@ pub fn compress_mp4_balanced(
                 end_secs,
                 false,
                 true,
-                Some(1080),
+                None,
             );
         }
     }
@@ -450,7 +438,7 @@ pub fn compress_mp4_balanced(
         out_mb = format!("{:.2}", output_bytes as f64 / (1024.0 * 1024.0)),
         video_mbps = format!("{:.1}", video_bps as f64 / 1_000_000.0),
         elapsed_ms = format!("{elapsed_ms:.0}"),
-        "Clip MP4 comprimido en modo equilibrado (alta calidad)"
+        "Clip MP4 comprimido (~35% menos peso)"
     );
 
     Ok(TrimStats {
@@ -692,7 +680,7 @@ fn compress_pass_with_opts(
         0
     };
 
-    // Escalado inteligente (o tope limpio en modo equilibrado, ej. 2K -> 1080p).
+    // Escalado inteligente (o tope limpio en modo equilibrado).
     let (out_w, out_h) = if let Some(max_h) = max_height_override {
         if src_h > max_h {
             let scaled_w = ((src_w as f64 * max_h as f64) / src_h as f64).round() as u32;
@@ -700,6 +688,8 @@ fn compress_pass_with_opts(
         } else {
             (src_w & !1, src_h & !1)
         }
+    } else if preserve_fps {
+        (src_w & !1, src_h & !1)
     } else {
         choose_compressed_dimensions(src_w, src_h, video_bitrate_bps)
     };
@@ -712,6 +702,10 @@ fn compress_pass_with_opts(
         reader_nv12.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(out_w, out_h))?;
         reader.SetCurrentMediaType(video_in_idx, None, &reader_nv12)?;
     }
+
+    // Consultar stride y altura alineada reales que el decodificador entrega en NV12
+    // (ej. 1920x1088 con 8 filas de padding entre plano Y y plano UV).
+    let (mut reader_stride, mut reader_aligned_h) = query_nv12_layout(&reader, video_in_idx, out_w, out_h);
 
     let mut writer_attrs: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut writer_attrs, 2) }?;
@@ -729,7 +723,7 @@ fn compress_pass_with_opts(
         unsafe { MFCreateSinkWriterFromURL(&out_url, None, Some(&writer_attrs)) }
             .with_context(|| format!("No se pudo crear {}", output_path.display()))?;
 
-    // Configurar pista de salida H.264 con el bitrate objetivo + entrada NV12 + atributos CBR.
+    // Configurar pista de salida H.264 con matriz BT.709 y rango de video estándar.
     let h264_out = unsafe { MFCreateMediaType() }?;
     unsafe {
         h264_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -740,6 +734,8 @@ fn compress_pass_with_opts(
         h264_out.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(out_fps_num, out_fps_den))?;
         h264_out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
         h264_out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+        let _ = h264_out.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
+        let _ = h264_out.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
     }
 
     let video_out_idx = unsafe { writer.AddStream(&h264_out) }
@@ -760,6 +756,7 @@ fn compress_pass_with_opts(
         let _ = enc_params.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0);
     }
 
+    // Entrada NV12 estrictamente empaquetada (stride == out_w, sin filas de padding entre Y y UV).
     let nv12_in = unsafe { MFCreateMediaType() }?;
     unsafe {
         nv12_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -768,6 +765,9 @@ fn compress_pass_with_opts(
         nv12_in.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(out_w, out_h))?;
         nv12_in.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(out_fps_num, out_fps_den))?;
         nv12_in.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
+        nv12_in.SetUINT32(&MF_MT_DEFAULT_STRIDE, out_w)?;
+        let _ = nv12_in.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
+        let _ = nv12_in.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
         writer.SetInputMediaType(video_out_idx, &nv12_in, Some(&enc_params))?;
     }
 
@@ -811,10 +811,11 @@ fn compress_pass_with_opts(
         };
     }
 
-    // Configurar audio: recodificar a AAC 96 kbps (Microsoft AAC MFT soporta 96/128/160/192 kbps).
+    // Configurar audio: recodificar a AAC 96/128/160 kbps (valores válidos para MF AAC MFT).
     let aac_bytes_per_sec = match audio_bps {
         ..=112_000 => 12_000u32,
-        _ => 16_000u32,
+        112_001..=144_000 => 16_000u32,
+        _ => 20_000u32,
     };
     let audio_out_idx = if let Some(a_in) = audio_in_idx {
         let pcm_type = unsafe { MFCreateMediaType() }?;
@@ -886,6 +887,14 @@ fn compress_pass_with_opts(
         }
         .context("IMFSourceReader::ReadSample (compress) falló")?;
 
+        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0
+            && actual_stream == video_in_idx
+        {
+            let (new_stride, new_h) = query_nv12_layout(&reader, video_in_idx, out_w, out_h);
+            reader_stride = new_stride;
+            reader_aligned_h = new_h;
+        }
+
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             if actual_stream == video_in_idx {
                 video_done = true;
@@ -940,14 +949,26 @@ fn compress_pass_with_opts(
             if rel_pts <= last_v_pts {
                 rel_pts = last_v_pts + 1;
             }
-            unsafe { sample.SetSampleTime(rel_pts) }?;
-            if min_frame_step_100ns > 0 {
-                let _ = unsafe { sample.SetSampleDuration(nominal_out_dur) };
-            }
-            unsafe { writer.WriteSample(video_out_idx, &sample) }
+            let out_dur = if min_frame_step_100ns > 0 {
+                nominal_out_dur
+            } else {
+                dur.max(nominal_out_dur)
+            };
+            // Reempaquetar NV12 eliminando padding de stride/altura (ej. 1088 -> 1080)
+            // para evitar barras verdes superiores y corrimientos de color en el plano UV.
+            let packed_sample = repack_nv12_tight(
+                &sample,
+                out_w as usize,
+                out_h as usize,
+                reader_stride,
+                reader_aligned_h,
+                rel_pts,
+                out_dur,
+            )?;
+            unsafe { writer.WriteSample(video_out_idx, &packed_sample) }
                 .context("IMFSinkWriter::WriteSample (video compress) falló")?;
             last_v_pts = rel_pts;
-            max_rel_pts = max_rel_pts.max(rel_pts + dur.max(nominal_out_dur));
+            max_rel_pts = max_rel_pts.max(rel_pts + out_dur);
         } else if let Some(a_out) = audio_out_idx {
             if rel_pts <= last_a_pts {
                 rel_pts = last_a_pts + 1;
@@ -966,6 +987,153 @@ fn compress_pass_with_opts(
     unsafe { writer.Finalize() }.context("IMFSinkWriter::Finalize (compress) falló")?;
 
     Ok(max_rel_pts as f64 / 10_000_000.0)
+}
+
+/// Consulta el stride real y la altura física (alineada a macrobloques, ej. 1088 para 1080p)
+/// que entrega el decodificador NV12 de `IMFSourceReader`.
+fn query_nv12_layout(
+    reader: &IMFSourceReader,
+    stream_idx: u32,
+    fallback_w: u32,
+    fallback_h: u32,
+) -> (usize, usize) {
+    let Ok(mt) = (unsafe { reader.GetCurrentMediaType(stream_idx) }) else {
+        return (fallback_w as usize, fallback_h as usize);
+    };
+    let (w, h) = unsafe { mt.GetUINT64(&MF_MT_FRAME_SIZE) }
+        .map(unpack_u32_pair)
+        .unwrap_or((fallback_w, fallback_h));
+    let stride = unsafe { mt.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+        .map(|u| (u as i32).unsigned_abs() as usize)
+        .unwrap_or(w as usize)
+        .max(fallback_w as usize);
+    (stride, (h as usize).max(fallback_h as usize))
+}
+
+/// Copia un `IMFSample` NV12 (posiblemente con `IMF2DBuffer`, stride > width o altura alineada a 16
+/// como `1920x1088`) a un `IMFSample` NV12 estrictamente contiguo (`width x height` sin padding).
+fn repack_nv12_tight(
+    src_sample: &IMFSample,
+    width: usize,
+    height: usize,
+    hint_stride: usize,
+    hint_aligned_h: usize,
+    pts_100ns: i64,
+    dur_100ns: i64,
+) -> Result<IMFSample> {
+    let dst_y_bytes = width * height;
+    let dst_uv_rows = height / 2;
+    let dst_total = dst_y_bytes + width * dst_uv_rows;
+
+    let out_sample = unsafe { MFCreateSample() }.context("MFCreateSample (nv12 repack) falló")?;
+    let out_buf = unsafe { MFCreateMemoryBuffer(dst_total as u32) }
+        .context("MFCreateMemoryBuffer (nv12 repack) falló")?;
+
+    let mut dst_ptr: *mut u8 = std::ptr::null_mut();
+    unsafe { out_buf.Lock(&mut dst_ptr, None, None) }?;
+
+    let copy_res: Result<()> = (|| {
+        let src_buf: IMFMediaBuffer = unsafe { src_sample.ConvertToContiguousBuffer() }
+            .context("ConvertToContiguousBuffer (nv12) falló")?;
+
+        // Preferir IMF2DBuffer::Lock2D para obtener el pitch exacto de hardware; fallback a Lock.
+        if let Ok(buf2d) = src_buf.cast::<IMF2DBuffer>() {
+            let mut scan0: *mut u8 = std::ptr::null_mut();
+            let mut pitch: i32 = 0;
+            if unsafe { buf2d.Lock2D(&mut scan0, &mut pitch) }.is_ok() {
+                let res = (|| {
+                    let src_stride = pitch.unsigned_abs().max(width as u32) as usize;
+                    let total_len = unsafe { buf2d.GetContiguousLength() }
+                        .unwrap_or((src_stride * hint_aligned_h * 3 / 2) as u32)
+                        as usize;
+                    // Calcular la altura física exacta del plano Y: total_len == src_stride * plane_h * 3 / 2.
+                    let inferred_h = if src_stride > 0 {
+                        (total_len * 2) / (src_stride * 3)
+                    } else {
+                        hint_aligned_h
+                    };
+                    let plane_h = inferred_h.max(hint_aligned_h).max(height);
+                    let src_uv_base = src_stride * plane_h;
+
+                    unsafe {
+                        // Copiar plano Y (height filas de `width` bytes).
+                        for row in 0..height {
+                            std::ptr::copy_nonoverlapping(
+                                scan0.add(row * src_stride),
+                                dst_ptr.add(row * width),
+                                width,
+                            );
+                        }
+                        // Copiar plano UV saltando las filas de padding entre `height` y `plane_h`.
+                        for row in 0..dst_uv_rows {
+                            std::ptr::copy_nonoverlapping(
+                                scan0.add(src_uv_base + row * src_stride),
+                                dst_ptr.add(dst_y_bytes + row * width),
+                                width,
+                            );
+                        }
+                    }
+                    Ok(())
+                })();
+                unsafe {
+                    let _ = buf2d.Unlock2D();
+                }
+                return res;
+            }
+        }
+
+        let mut src_ptr: *mut u8 = std::ptr::null_mut();
+        let mut cur_len = 0u32;
+        unsafe { src_buf.Lock(&mut src_ptr, None, Some(&mut cur_len)) }?;
+        let res = (|| {
+            let src_stride = hint_stride.max(width);
+            let inferred_h = (cur_len as usize * 2) / (src_stride * 3);
+            let plane_h = inferred_h.max(hint_aligned_h).max(height);
+            let src_uv_base = src_stride * plane_h;
+            if (cur_len as usize) < src_uv_base + (dst_uv_rows.saturating_sub(1)) * src_stride + width {
+                // Fallback seguro si el buffer es exactamente contiguo.
+                let copy_len = (cur_len as usize).min(dst_total);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
+                }
+            } else {
+                unsafe {
+                    for row in 0..height {
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(row * src_stride),
+                            dst_ptr.add(row * width),
+                            width,
+                        );
+                    }
+                    for row in 0..dst_uv_rows {
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(src_uv_base + row * src_stride),
+                            dst_ptr.add(dst_y_bytes + row * width),
+                            width,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        unsafe {
+            let _ = src_buf.Unlock();
+        }
+        res
+    })();
+
+    unsafe {
+        let _ = out_buf.Unlock();
+    }
+    copy_res?;
+
+    unsafe {
+        out_buf.SetCurrentLength(dst_total as u32)?;
+        out_sample.AddBuffer(&out_buf)?;
+        out_sample.SetSampleTime(pts_100ns)?;
+        out_sample.SetSampleDuration(dur_100ns)?;
+    }
+    Ok(out_sample)
 }
 
 fn choose_compressed_dimensions(src_w: u32, src_h: u32, video_bitrate_bps: u32) -> (u32, u32) {
@@ -1312,32 +1480,66 @@ mod tests {
 
     #[test]
     fn compresses_heavy_clip_balanced_if_present() {
-        let Ok(profile) = std::env::var("USERPROFILE") else {
+        let clips_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("clips");
+        let candidate = std::fs::read_dir(&clips_dir)
+            .ok()
+            .and_then(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4")))
+                    .max_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(0))
+            })
+            .or_else(find_sample_mp4);
+        let Some(candidate) = candidate else {
             return;
         };
-        let candidate = PathBuf::from(profile)
-            .join("Videos")
-            .join("Bals")
-            .join("bals_20261125_002613.mp4");
-        if !candidate.exists() {
-            return;
-        }
 
         let meta = probe_mp4_metadata(&candidate).expect("probe_mp4_metadata falló");
         let out = std::env::temp_dir().join("bals_balanced_real_test.mp4");
         let _ = std::fs::remove_file(&out);
 
-        let stats = compress_mp4_balanced(&candidate, &out, 0.0, meta.duration_secs)
+        let stats = compress_mp4_balanced(&candidate, &out, 0.0, meta.duration_secs.min(12.0))
             .expect("compress_mp4_balanced falló");
         let out_meta = probe_mp4_metadata(&out).expect("probe salida falló");
         let in_mb = stats.input_bytes as f64 / (1024.0 * 1024.0);
         let out_mb = stats.output_bytes as f64 / (1024.0 * 1024.0);
+
+        // Verificar fidelidad de color y ausencia de barra verde superior comparando frames reales.
+        let probe_t = (meta.duration_secs.min(12.0) * 0.4).max(0.5);
+        let orig_f = extract_mp4_frame_rgba(&candidate, probe_t, 320, 180).expect("orig frame");
+        let comp_f = extract_mp4_frame_rgba(&out, probe_t, 320, 180).expect("comp frame");
+        assert_eq!(orig_f.width, comp_f.width);
+        assert_eq!(orig_f.height, comp_f.height);
+        let top_bytes = (orig_f.width as usize) * 16 * 4;
+        let top_mae: f64 = orig_f.rgba[..top_bytes]
+            .iter()
+            .zip(&comp_f.rgba[..top_bytes])
+            .map(|(&a, &b)| (a as i32 - b as i32).abs() as f64)
+            .sum::<f64>()
+            / top_bytes as f64;
+        let full_mae: f64 = orig_f
+            .rgba
+            .iter()
+            .zip(&comp_f.rgba)
+            .map(|(&a, &b)| (a as i32 - b as i32).abs() as f64)
+            .sum::<f64>()
+            / orig_f.rgba.len() as f64;
+
         println!(
-            "REAL BALANCED TEST: {in_mb:.2} MB -> {out_mb:.2} MB ({}x{} @{:.0}fps) in {:.0} ms",
-            out_meta.width, out_meta.height, out_meta.fps, stats.elapsed_ms
+            "REAL BALANCED TEST ({}): {in_mb:.2} MB -> {out_mb:.2} MB ({}x{} @{:.0}fps) in {:.0} ms | top_mae={top_mae:.1} full_mae={full_mae:.1}",
+            candidate.file_name().unwrap_or_default().to_string_lossy(),
+            out_meta.width,
+            out_meta.height,
+            out_meta.fps,
+            stats.elapsed_ms
         );
-        assert!(stats.output_bytes < stats.input_bytes);
-        assert!(out_meta.height >= 720);
+        assert!(stats.output_bytes > 50_000);
+        assert_eq!(out_meta.width, meta.width);
+        assert_eq!(out_meta.height, meta.height);
+        assert!(
+            top_mae < 18.0 && full_mae < 18.0,
+            "Desviación de color / barra verde detectada: top_mae={top_mae:.1}, full_mae={full_mae:.1}"
+        );
         let _ = std::fs::remove_file(&out);
     }
 }

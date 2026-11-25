@@ -438,11 +438,11 @@ fn render_crt_deck(
                     ui,
                     p,
                     false,
-                    "COMPRIMIR CLIP (ALTA CALIDAD · MENOS PESO)",
+                    "COMPRIMIR CLIP (~35% MENOS PESO · ALTA CALIDAD)",
                     vec2(row_w, 27.0),
                 )
                 .on_hover_text(
-                    "Reduce ~45–65% el peso manteniendo hasta 1080p y 60 FPS nítidos (sin aplastar la imagen)",
+                    "Reduce ~35% el peso manteniendo resolución y FPS originales sin perder calidad visual",
                 )
                 .clicked()
                 {

@@ -336,7 +336,7 @@ impl BalsUiApp {
             *st = TrimState::Running("COMPRIMIENDO...".to_string());
         }
         self.set_banner(
-            "Comprimiendo clip en alta calidad (1080p/60fps)...",
+            "Comprimiendo clip (~35% menos peso en calidad original)...",
             false,
         );
 
