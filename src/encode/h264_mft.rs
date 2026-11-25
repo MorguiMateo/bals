@@ -1,0 +1,551 @@
+use std::mem::ManuallyDrop;
+
+use anyhow::{Context, Result, bail};
+use tracing::{debug, info, warn};
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Media::MediaFoundation::{
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
+    ICodecAPI, IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator,
+    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput,
+    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MFTEnumEx,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video,
+    MFSampleExtension_CleanPoint, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Main,
+};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Variant::VARIANT;
+use windows::core::{IUnknown, Interface};
+
+use crate::config::VideoConfig;
+use crate::d3d::SharedD3DDevice;
+use crate::encode::{EncodedVideoPacket, annexb_contains_idr};
+
+/// Encoder H.264 por Hardware vía Windows Media Foundation (NVENC / AMD AMF / Intel QSV),
+/// con soporte Zero-Copy sobre texturas D3D11 `NV12` y fallback automático a MFT software.
+pub struct H264Encoder {
+    mft: IMFTransform,
+    codec_api: Option<ICodecAPI>,
+    event_gen: Option<IMFMediaEventGenerator>,
+    _dxgi_manager: Option<IMFDXGIDeviceManager>,
+    #[allow(dead_code)]
+    pub name: String,
+    #[allow(dead_code)]
+    pub is_hardware: bool,
+    pub is_async: bool,
+    mft_provides_output_samples: bool,
+    output_buffer_size: u32,
+    pending_input_requests: usize,
+    frame_duration_100ns: i64,
+    gop_duration_100ns: i64,
+    last_forced_kf_ts: Option<i64>,
+    mf_started: bool,
+}
+
+impl H264Encoder {
+    pub fn new(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
+        unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup falló")?;
+
+        match Self::init_inner(d3d, config) {
+            Ok(enc) => Ok(enc),
+            Err(err) => {
+                unsafe {
+                    let _ = MFShutdown();
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn init_inner(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
+        // 1. Buscar primero encoders H.264 por HARDWARE (AMD AMF / NVIDIA NVENC / Intel QSV).
+        //    Si no hay hardware disponible (PC muy antiguo), hacer fallback a software MFT.
+        let (mft, name, is_hardware) = match activate_h264_mft(true) {
+            Ok((mft, name)) => (mft, name, true),
+            Err(hw_err) => {
+                warn!("No se pudo activar encoder H.264 por hardware ({hw_err:#}); usando fallback software");
+                let (mft, name) = activate_h264_mft(false)
+                    .context("No se encontró ningún encoder H.264 en Media Foundation")?;
+                (mft, name, false)
+            }
+        };
+
+        // 2. Comprobar si es un MFT asíncrono (prácticamente todos los HW MFT lo son) y desbloquearlo.
+        let attrs = unsafe { mft.GetAttributes() }.context("GetAttributes en MFT falló")?;
+        let is_async = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
+        if is_async {
+            unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
+                .context("No se pudo desbloquear el MFT asíncrono (MF_TRANSFORM_ASYNC_UNLOCK)")?;
+        }
+
+        // 3. Si soporta D3D11 (Zero-Copy), vincular el mismo ID3D11Device mediante IMFDXGIDeviceManager.
+        let d3d11_aware = unsafe { attrs.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or(0) != 0;
+        let mut dxgi_manager = None;
+        if is_hardware || d3d11_aware {
+            let mut reset_token = 0u32;
+            let mut mgr: Option<IMFDXGIDeviceManager> = None;
+            unsafe { MFCreateDXGIDeviceManager(&mut reset_token, &mut mgr) }
+                .context("MFCreateDXGIDeviceManager falló")?;
+            let mgr = mgr.context("MFCreateDXGIDeviceManager devolvió None")?;
+            unsafe { mgr.ResetDevice(&d3d.device, reset_token) }
+                .context("IMFDXGIDeviceManager::ResetDevice falló")?;
+
+            let mgr_unk: IUnknown = mgr.cast()?;
+            unsafe {
+                mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_unk.as_raw() as usize)
+            }
+            .context("MFT_MESSAGE_SET_D3D_MANAGER falló")?;
+            dxgi_manager = Some(mgr);
+        }
+
+        // 4. Configurar tipos de salida (H.264) y entrada (NV12).
+        let (width, height) = config.resolution.dimensions();
+        let fps = config.fps.as_u32();
+
+        let output_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (out) falló")?;
+        unsafe {
+            output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            output_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_bps)?;
+            output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
+            output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
+            output_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
+            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
+            mft.SetOutputType(0, &output_type, 0)
+        }
+        .context("IMFTransform::SetOutputType (H.264) falló")?;
+
+        let input_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (in) falló")?;
+        unsafe {
+            input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            input_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+            input_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            input_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
+            input_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
+            input_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
+            mft.SetInputType(0, &input_type, 0)
+        }
+        .context("IMFTransform::SetInputType (NV12) falló")?;
+
+        // 5. Configurar parámetros finos vía ICodecAPI (GOP, baja latencia, 0 B-frames, bitrate).
+        configure_codec_api(&mft, config);
+
+        // 6. Consultar si el MFT asigna sus propios samples de salida.
+        let out_info = unsafe { mft.GetOutputStreamInfo(0) }
+            .context("GetOutputStreamInfo falló")?;
+        let mft_provides_output_samples = (out_info.dwFlags
+            & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
+                | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32))
+            != 0;
+        let output_buffer_size = out_info.cbSize.max(512 * 1024);
+
+        let event_gen = if is_async {
+            Some(
+                mft.cast::<IMFMediaEventGenerator>()
+                    .context("El MFT asíncrono no implementa IMFMediaEventGenerator")?,
+            )
+        } else {
+            None
+        };
+
+        // 7. Arrancar streaming del MFT.
+        unsafe {
+            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+        }
+
+        info!(
+            encoder = %name,
+            hardware = is_hardware,
+            async_mft = is_async,
+            zero_copy = dxgi_manager.is_some(),
+            resolution = %config.resolution,
+            fps = %config.fps,
+            bitrate_mbps = format!("{:.1}", config.bitrate_bps as f64 / 1_000_000.0),
+            gop_frames = config.gop_frames(),
+            "Encoder H.264 Media Foundation iniciado"
+        );
+
+        let codec_api = mft.cast::<ICodecAPI>().ok();
+
+        Ok(Self {
+            mft,
+            codec_api,
+            event_gen,
+            _dxgi_manager: dxgi_manager,
+            name,
+            is_hardware,
+            is_async,
+            mft_provides_output_samples,
+            output_buffer_size,
+            pending_input_requests: 0,
+            frame_duration_100ns: config.fps.frame_duration_100ns(),
+            gop_duration_100ns: config.gop_duration_100ns(),
+            last_forced_kf_ts: None,
+            mf_started: true,
+        })
+    }
+
+    /// Solicita explícitamente un Keyframe (IDR) al encoder para el próximo frame.
+    pub fn force_keyframe(&self) {
+        if let Some(api) = &self.codec_api {
+            let var = VARIANT::from(1u32);
+            if let Err(err) = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var) } {
+                debug!("CODECAPI_AVEncVideoForceKeyFrame no soportado: {err}");
+            }
+        }
+    }
+
+    /// Envía una textura `ID3D11Texture2D` (`NV12`) en VRAM al encoder (Zero-Copy)
+    /// y devuelve los paquetes H.264 listos en este ciclo.
+    pub fn encode_nv12_texture(
+        &mut self,
+        nv12_texture: &ID3D11Texture2D,
+        timestamp_100ns: i64,
+    ) -> Result<Vec<EncodedVideoPacket>> {
+        // Garantizar un Keyframe (IDR) cada `gop_secs` por tiempo real (no solo por conteo de frames),
+        // vital cuando WGC reduce los FPS en menús o pantallas estáticas.
+        match self.last_forced_kf_ts {
+            None => {
+                self.force_keyframe();
+                self.last_forced_kf_ts = Some(timestamp_100ns);
+            }
+            Some(prev) if timestamp_100ns.saturating_sub(prev) >= self.gop_duration_100ns => {
+                self.force_keyframe();
+                self.last_forced_kf_ts = Some(timestamp_100ns);
+            }
+            _ => {}
+        }
+
+        let sample = create_sample_from_texture(nv12_texture, timestamp_100ns, self.frame_duration_100ns)?;
+        let mut packets = Vec::new();
+
+        if self.is_async {
+            // En MFT asíncrono debemos esperar un METransformNeedInput antes de ProcessInput,
+            // drenando cualquier METransformHaveOutput que llegue mientras tanto para no bloquearnos.
+            while self.pending_input_requests == 0 {
+                self.poll_async_event(false, &mut packets)?;
+            }
+            self.pending_input_requests -= 1;
+
+            unsafe { self.mft.ProcessInput(0, &sample, 0) }
+                .context("ProcessInput (async MFT) falló")?;
+
+            // Drenar todas las salidas que ya estén disponibles sin bloquear.
+            while self.poll_async_event(true, &mut packets)? {}
+        } else {
+            unsafe { self.mft.ProcessInput(0, &sample, 0) }
+                .context("ProcessInput (sync MFT) falló")?;
+
+            loop {
+                match self.pull_output_packet()? {
+                    Some(pkt) => packets.push(pkt),
+                    None => break,
+                }
+            }
+        }
+
+        Ok(packets)
+    }
+
+    /// Drena todos los frames pendientes dentro del encoder al detener una sesión.
+    pub fn flush(&mut self) -> Result<Vec<EncodedVideoPacket>> {
+        let mut packets = Vec::new();
+        unsafe {
+            let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        }
+
+        if let Some(event_gen) = self.event_gen.clone() {
+            loop {
+                let event = match unsafe { event_gen.GetEvent(windows::Win32::Media::MediaFoundation::MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)) } {
+                    Ok(ev) => ev,
+                    Err(_) => break,
+                };
+                let ev_type = unsafe { event.GetType() }.unwrap_or(0);
+                if ev_type == METransformHaveOutput.0 as u32 {
+                    if let Some(pkt) = self.pull_output_packet()? {
+                        packets.push(pkt);
+                    }
+                } else if ev_type == METransformDrainComplete.0 as u32 {
+                    break;
+                }
+            }
+        } else {
+            while let Some(pkt) = self.pull_output_packet()? {
+                packets.push(pkt);
+            }
+        }
+
+        Ok(packets)
+    }
+
+    fn poll_async_event(
+        &mut self,
+        non_blocking: bool,
+        packets: &mut Vec<EncodedVideoPacket>,
+    ) -> Result<bool> {
+        let Some(event_gen) = &self.event_gen else {
+            return Ok(false);
+        };
+
+        let flags = if non_blocking {
+            MF_EVENT_FLAG_NO_WAIT
+        } else {
+            windows::Win32::Media::MediaFoundation::MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)
+        };
+
+        let event = match unsafe { event_gen.GetEvent(flags) } {
+            Ok(ev) => ev,
+            Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(false),
+            Err(err) => return Err(err).context("IMFMediaEventGenerator::GetEvent falló"),
+        };
+
+        let ev_type = unsafe { event.GetType() }.context("IMFMediaEvent::GetType falló")?;
+        if ev_type == METransformNeedInput.0 as u32 {
+            self.pending_input_requests += 1;
+        } else if ev_type == METransformHaveOutput.0 as u32 {
+            if let Some(pkt) = self.pull_output_packet()? {
+                packets.push(pkt);
+            }
+        } else if ev_type == METransformDrainComplete.0 as u32 {
+            debug!("METransformDrainComplete recibido");
+        }
+
+        Ok(true)
+    }
+
+    fn pull_output_packet(&mut self) -> Result<Option<EncodedVideoPacket>> {
+        let provided_sample = if self.mft_provides_output_samples {
+            None
+        } else {
+            let sample = unsafe { MFCreateSample() }.context("MFCreateSample (out) falló")?;
+            let buffer = unsafe { MFCreateMemoryBuffer(self.output_buffer_size) }
+                .context("MFCreateMemoryBuffer falló")?;
+            unsafe { sample.AddBuffer(&buffer) }?;
+            Some(sample)
+        };
+
+        let mut output_buffers = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(provided_sample),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+
+        let hr = unsafe { self.mft.ProcessOutput(0, &mut output_buffers, &mut status) };
+
+        // Extraer los Option fuera de ManuallyDrop para asegurar que se liberen siempre.
+        let out_sample = unsafe { ManuallyDrop::take(&mut output_buffers[0].pSample) };
+        let _out_events = unsafe { ManuallyDrop::take(&mut output_buffers[0].pEvents) };
+
+        match hr {
+            Ok(()) => {}
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                debug!("MFT reportó MF_E_TRANSFORM_STREAM_CHANGE; refrescando tipo de salida");
+                if let Ok(new_type) = unsafe { self.mft.GetOutputAvailableType(0, 0) } {
+                    let _ = unsafe { self.mft.SetOutputType(0, &new_type, 0) };
+                }
+                return Ok(None);
+            }
+            Err(err) => return Err(err).context("IMFTransform::ProcessOutput falló"),
+        }
+
+        let Some(sample) = out_sample else {
+            return Ok(None);
+        };
+
+        let pts_100ns = unsafe { sample.GetSampleTime() }.unwrap_or(0);
+        let duration_100ns = unsafe { sample.GetSampleDuration() }.unwrap_or(self.frame_duration_100ns);
+        let clean_point = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
+
+        let buffer: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer() }
+            .context("IMFSample::ConvertToContiguousBuffer falló")?;
+
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut current_len = 0u32;
+        unsafe { buffer.Lock(&mut ptr, None, Some(&mut current_len)) }
+            .context("IMFMediaBuffer::Lock falló")?;
+
+        let data = if !ptr.is_null() && current_len > 0 {
+            unsafe { std::slice::from_raw_parts(ptr, current_len as usize) }.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        unsafe {
+            let _ = buffer.Unlock();
+        }
+
+        if data.is_empty() {
+            return Ok(None);
+        }
+
+        let is_keyframe = clean_point || annexb_contains_idr(&data);
+
+        Ok(Some(EncodedVideoPacket {
+            data,
+            pts_100ns,
+            duration_100ns,
+            is_keyframe,
+        }))
+    }
+}
+
+impl Drop for H264Encoder {
+    fn drop(&mut self) {
+        if self.mf_started {
+            unsafe {
+                let _ = MFShutdown();
+            }
+        }
+    }
+}
+
+fn activate_h264_mft(hardware: bool) -> Result<(IMFTransform, String)> {
+    let output_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
+
+    let flags = if hardware {
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER
+    } else {
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER
+    };
+
+    let mut raw_activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+
+    unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            None,
+            Some(&output_info),
+            &mut raw_activates,
+            &mut count,
+        )
+    }
+    .context("MFTEnumEx falló")?;
+
+    if count == 0 || raw_activates.is_null() {
+        bail!("MFTEnumEx devolvió 0 encoders H.264 (hardware={hardware})");
+    }
+
+    let mut chosen: Option<(IMFTransform, String)> = None;
+    let slice = unsafe { std::slice::from_raw_parts_mut(raw_activates, count as usize) };
+
+    for slot in slice.iter_mut() {
+        if let Some(activate) = slot.take() {
+            let friendly = get_friendly_name(&activate).unwrap_or_else(|| "H264 MFT".to_string());
+            if chosen.is_none() {
+                match unsafe { activate.ActivateObject::<IMFTransform>() } {
+                    Ok(mft) => {
+                        chosen = Some((mft, friendly));
+                    }
+                    Err(err) => {
+                        warn!(encoder = %friendly, "No se pudo activar MFT: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe {
+        CoTaskMemFree(Some(raw_activates as *const _));
+    }
+
+    chosen.context("Ninguno de los MFT enumerados pudo activarse")
+}
+
+fn get_friendly_name(activate: &IMFActivate) -> Option<String> {
+    let mut len = 0u32;
+    unsafe { activate.GetStringLength(&MFT_FRIENDLY_NAME_Attribute) }
+        .ok()
+        .map(|l| len = l)?;
+    let mut buf = vec![0u16; len as usize + 1];
+    unsafe { activate.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut buf, None) }.ok()?;
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+fn configure_codec_api(mft: &IMFTransform, config: VideoConfig) {
+    let Ok(codec_api) = mft.cast::<ICodecAPI>() else {
+        debug!("El MFT no expone ICodecAPI; se usarán sus valores por defecto");
+        return;
+    };
+
+    let set_u32 = |guid: &windows::core::GUID, val: u32, label: &str| {
+        let var = VARIANT::from(val);
+        if let Err(err) = unsafe { codec_api.SetValue(guid, &var) } {
+            debug!("ICodecAPI {label} no soportado por este driver: {err}");
+        }
+    };
+
+    let set_bool = |guid: &windows::core::GUID, val: bool, label: &str| {
+        let var = VARIANT::from(val);
+        if let Err(err) = unsafe { codec_api.SetValue(guid, &var) } {
+            debug!("ICodecAPI {label} no soportado por este driver: {err}");
+        }
+    };
+
+    set_u32(
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_CBR.0 as u32,
+        "RateControlMode=CBR",
+    );
+    set_u32(
+        &CODECAPI_AVEncCommonMeanBitRate,
+        config.bitrate_bps,
+        "MeanBitRate",
+    );
+    set_u32(&CODECAPI_AVEncMPVGOPSize, config.gop_frames(), "GOPSize");
+    // 0 B-frames: baja latencia, menos VRAM y PTS == DTS para muxing MP4 simple y fiable.
+    set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");
+    set_bool(&CODECAPI_AVLowLatencyMode, true, "LowLatencyMode=true");
+}
+
+fn create_sample_from_texture(
+    texture: &ID3D11Texture2D,
+    timestamp_100ns: i64,
+    duration_100ns: i64,
+) -> Result<IMFSample> {
+    let sample = unsafe { MFCreateSample() }.context("MFCreateSample falló")?;
+    let buffer = unsafe {
+        MFCreateDXGISurfaceBuffer(
+            &ID3D11Texture2D::IID,
+            texture,
+            0,
+            false,
+        )
+    }
+    .context("MFCreateDXGISurfaceBuffer falló")?;
+
+    unsafe {
+        sample.AddBuffer(&buffer)?;
+        sample.SetSampleTime(timestamp_100ns)?;
+        sample.SetSampleDuration(duration_100ns)?;
+    }
+
+    Ok(sample)
+}
+
+#[inline]
+const fn pack_u32_pair(high: u32, low: u32) -> u64 {
+    ((high as u64) << 32) | (low as u64)
+}

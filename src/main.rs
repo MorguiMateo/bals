@@ -1,0 +1,250 @@
+// Ocultar ventana de consola en compilación --release para uso limpio en escritorio/bandeja.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod audio;
+mod buffer;
+mod capture;
+mod clock;
+mod config;
+mod d3d;
+mod encode;
+mod engine;
+mod game_detect;
+mod hotkey;
+mod ipc;
+mod muxer;
+mod tray;
+mod trimmer;
+mod ui;
+mod updater;
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use tracing::{info, warn};
+use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+
+use crate::audio::AudioPipeline;
+use crate::buffer::ReplayBuffer;
+use crate::capture::CaptureTarget;
+use crate::capture::wgc::WgcCapture;
+use crate::config::{
+    AppConfig, AudioConfig, AudioSource, FrameRate, ReplayDuration, Resolution, VideoConfig,
+};
+use crate::d3d::SharedD3DDevice;
+use crate::encode::h264_mft::H264Encoder;
+use crate::encode::video_processor::GpuNv12Converter;
+use crate::engine::RecorderEngine;
+use crate::muxer::{generate_clip_path, write_mp4_clip};
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    updater::cleanup_old_binary();
+
+    match args.first().map(String::as_str) {
+        // Proceso de interfaz gráfica bajo demanda: al cerrarse libera el 100% de RAM/GPU.
+        Some("--ui") => return ui::run_gui(),
+        // Arranque silencioso directo a la bandeja del sistema (ideal para Inicio de Windows).
+        Some("--tray") => return run_daemon(false),
+        // Prueba CLI automatizada: `bals --test [720p|1080p|2k] [30|60] [segundos] [--pid <PID>]`
+        Some("--test") => return run_cli_test(&args[1..]),
+        _ => {}
+    }
+
+    // Instancia única: si el motor ya está en la bandeja, solo abrir o enfocar la ventana UI.
+    if ipc::is_daemon_running() {
+        ipc::spawn_or_focus_ui();
+        return Ok(());
+    }
+
+    // Primer arranque normal: inicia el motor en bandeja y abre la ventana de bienvenida/ajustes.
+    run_daemon(true)
+}
+
+fn run_daemon(open_ui_on_start: bool) -> Result<()> {
+    let cfg = AppConfig::load_or_create();
+    let engine = RecorderEngine::spawn(cfg.clone())?;
+
+    if cfg.auto_update {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(6));
+            match updater::check_latest_release() {
+                Ok(Some(info)) => {
+                    info!(version = %info.version, "Nueva versión detectada; actualizando en segundo plano");
+                    if let Err(err) = updater::download_and_apply_update(&info, &["--tray"]) {
+                        warn!("No se pudo aplicar la actualización automática: {err:#}");
+                    } else {
+                        ipc::notify_shutdown();
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!("Comprobación de actualización omitida: {err:#}");
+                }
+            }
+        });
+    }
+
+    if open_ui_on_start {
+        // Abrir la ventana UI tras un breve respiro para que la ventana de bandeja ya esté creada.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(250));
+            ipc::spawn_or_focus_ui();
+        });
+    }
+
+    let tray_res = tray::run_tray_loop(
+        cfg,
+        engine.cmd_tx.clone(),
+        engine.event_rx.clone(),
+        engine.status.clone(),
+    );
+
+    engine.shutdown();
+    tray_res
+}
+
+fn run_cli_test(test_args: &[String]) -> Result<()> {
+    let resolution = test_args
+        .first()
+        .and_then(|s| Resolution::from_str_opt(s))
+        .unwrap_or(Resolution::P1080);
+    let fps = test_args
+        .get(1)
+        .and_then(|s| FrameRate::from_str_opt(s))
+        .unwrap_or(FrameRate::Fps60);
+    let record_secs: u64 = test_args
+        .get(2)
+        .filter(|s| !s.starts_with("--"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let pid_opt = test_args
+        .windows(2)
+        .find(|w| w[0] == "--pid")
+        .and_then(|w| w[1].parse::<u32>().ok());
+
+    let video_config = VideoConfig::preset(resolution, fps);
+    let audio_config = AudioConfig {
+        source: match pid_opt {
+            Some(pid) => AudioSource::ProcessLoopback {
+                pid,
+                include_tree: true,
+            },
+            None => AudioSource::SystemLoopback,
+        },
+        ..AudioConfig::default()
+    };
+
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.context("RoInitialize falló")?;
+    let res = run_av_clip_test(video_config, audio_config, ReplayDuration::Sec30, record_secs);
+    unsafe { RoUninitialize() };
+    res
+}
+
+fn run_av_clip_test(
+    video_config: VideoConfig,
+    audio_config: AudioConfig,
+    replay_duration: ReplayDuration,
+    record_secs: u64,
+) -> Result<()> {
+    let d3d = SharedD3DDevice::new()?;
+    let capture = WgcCapture::start(&d3d, CaptureTarget::PrimaryMonitor, true, 2)?;
+
+    let (out_w, out_h) = video_config.resolution.dimensions();
+    let mut converter = GpuNv12Converter::new(
+        &d3d,
+        capture.initial_size.Width as u32,
+        capture.initial_size.Height as u32,
+        out_w,
+        out_h,
+        video_config.fps.as_u32(),
+    )?;
+    let mut encoder = H264Encoder::new(&d3d, video_config)?;
+
+    let mut replay_buffer = ReplayBuffer::new(replay_duration.as_secs(), 128 * 1024 * 1024);
+
+    let mut audio_pipeline = match AudioPipeline::start(audio_config) {
+        Ok(pipe) => {
+            replay_buffer.set_audio_info(pipe.stream_info.clone());
+            Some(pipe)
+        }
+        Err(err) => {
+            warn!("No se pudo iniciar el pipeline de audio ({err:#}); continuando solo con video");
+            None
+        }
+    };
+
+    let frame_interval_100ns = video_config.fps.frame_duration_100ns();
+    let min_step_100ns = (frame_interval_100ns * 85) / 100;
+
+    let test_duration = Duration::from_secs(record_secs);
+    let start = Instant::now();
+    let mut last_encoded_ts: Option<i64> = None;
+
+    while start.elapsed() < test_duration {
+        if let Some(audio) = &audio_pipeline {
+            while let Ok(apkt) = audio.rx.try_recv() {
+                replay_buffer.push_audio(apkt);
+            }
+        }
+
+        match capture.rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(frame) => {
+                if let Some(prev) = last_encoded_ts {
+                    if frame.timestamp_100ns.saturating_sub(prev) < min_step_100ns {
+                        continue;
+                    }
+                }
+                last_encoded_ts = Some(frame.timestamp_100ns);
+
+                let nv12 = converter.convert(&frame.texture, frame.width, frame.height)?;
+                let pkts = encoder.encode_nv12_texture(&nv12, frame.timestamp_100ns)?;
+                for pkt in pkts {
+                    replay_buffer.push_video(pkt);
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if let Some(mut audio) = audio_pipeline.take() {
+        audio.stop();
+        while let Ok(apkt) = audio.rx.try_recv() {
+            replay_buffer.push_audio(apkt);
+        }
+    }
+
+    for pkt in encoder.flush()? {
+        replay_buffer.push_video(pkt);
+    }
+
+    let received = capture.stats.frames_received.load(Ordering::Relaxed);
+    let dropped = capture.stats.frames_dropped.load(Ordering::Relaxed);
+    info!(received, dropped, "Prueba CLI finalizada");
+
+    let snapshot = replay_buffer
+        .snapshot(Some(replay_duration.as_secs()))
+        .context("El buffer circular está vacío")?;
+
+    let clips_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("clips");
+    let clip_path = generate_clip_path(&clips_dir);
+
+    let stats = write_mp4_clip(&clip_path, &snapshot, video_config)?;
+    info!(
+        file = %stats.path.display(),
+        size_kb = stats.file_bytes / 1024,
+        "Clip CLI generado"
+    );
+
+    Ok(())
+}

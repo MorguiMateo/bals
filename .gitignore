@@ -1,0 +1,9 @@
+/target
+/clips
+/dist
+*.mp4
+*.old
+*.new
+bals_config.toml
+.DS_Store
+Thumbs.db

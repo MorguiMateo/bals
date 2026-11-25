@@ -1,0 +1,733 @@
+use std::cell::RefCell;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender};
+use tracing::{info, warn};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDI_APPLICATION,
+    LoadIconW, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    MSG, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW,
+};
+use windows::core::{HSTRING, PCWSTR, w};
+
+use crate::config::{AppConfig, CaptureMode, FrameRate, ReplayDuration, Resolution};
+use crate::engine::{EngineCommand, EngineEvent, EngineStatus, RecordingState};
+use crate::hotkey::parse_hotkey;
+use crate::ipc::{
+    TRAY_WINDOW_CLASS, WM_BALS_RELOAD_CONFIG, WM_BALS_SAVE_CLIP, WM_BALS_SHUTDOWN,
+    WM_BALS_TOGGLE_RECORD, spawn_or_focus_ui,
+};
+
+const WM_TRAY_ICON: u32 = WM_APP + 1;
+const HOTKEY_SAVE_CLIP_ID: i32 = 1;
+const TIMER_EVENTS_ID: usize = 1;
+const TRAY_ICON_UID: u32 = 1;
+
+// IDs de comandos del menú contextual de la bandeja.
+const IDM_OPEN_UI: usize = 1000;
+const IDM_SAVE_CLIP: usize = 1001;
+const IDM_TOGGLE_RECORD: usize = 1002;
+const IDM_TOGGLE_AUTODETECT: usize = 1003;
+const IDM_RES_720: usize = 1010;
+const IDM_RES_1080: usize = 1011;
+const IDM_RES_1440: usize = 1012;
+const IDM_FPS_30: usize = 1020;
+const IDM_FPS_60: usize = 1021;
+const IDM_DUR_15: usize = 1030;
+const IDM_DUR_30: usize = 1031;
+const IDM_DUR_60: usize = 1032;
+const IDM_DUR_120: usize = 1033;
+const IDM_TOGGLE_MIC: usize = 1040;
+const IDM_OPEN_CLIPS: usize = 1050;
+const IDM_OPEN_CONFIG: usize = 1051;
+const IDM_EXIT: usize = 1099;
+
+struct TrayState {
+    hwnd: HWND,
+    cfg: AppConfig,
+    cmd_tx: Sender<EngineCommand>,
+    event_rx: Receiver<EngineEvent>,
+    status: Arc<Mutex<EngineStatus>>,
+    icon_idle: HICON,
+    icon_rec: HICON,
+    custom_icons: bool,
+}
+
+thread_local! {
+    static TRAY_STATE: RefCell<Option<TrayState>> = const { RefCell::new(None) };
+}
+
+/// Ejecuta el bucle nativo Win32 de la bandeja del sistema + Hotkey global (`\`).
+/// Consume ~1 MB de RAM y 0% CPU en reposo.
+pub fn run_tray_loop(
+    cfg: AppConfig,
+    cmd_tx: Sender<EngineCommand>,
+    event_rx: Receiver<EngineEvent>,
+    status: Arc<Mutex<EngineStatus>>,
+) -> Result<()> {
+    let hinstance = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW falló")?;
+    let class_name = TRAY_WINDOW_CLASS;
+
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(wnd_proc),
+        hInstance: hinstance.into(),
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+
+    unsafe { RegisterClassW(&wc) };
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            w!("Bals"),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance.into()),
+            None,
+        )
+    }
+    .context("CreateWindowExW (Bals Tray) falló")?;
+
+    // Registrar atajo global (por defecto `\`).
+    register_save_hotkey(hwnd, &cfg.save_clip_hotkey);
+
+    // Crear iconos programáticos (verde = en espera, rojo = grabando) sin archivos .ico externos.
+    let (icon_idle, icon_rec, custom_icons) = create_status_icons();
+
+    // Añadir icono a la bandeja del sistema.
+    add_tray_icon(hwnd, icon_idle, &cfg);
+
+    // Timer ligero cada 200 ms para drenar eventos del motor (notificaciones de clip guardado).
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_EVENTS_ID, 200, None);
+    }
+
+    TRAY_STATE.with(|slot| {
+        *slot.borrow_mut() = Some(TrayState {
+            hwnd,
+            cfg: cfg.clone(),
+            cmd_tx,
+            event_rx,
+            status,
+            icon_idle,
+            icon_rec,
+            custom_icons,
+        });
+    });
+
+    info!(
+        hotkey = %cfg.save_clip_hotkey,
+        clips_dir = %cfg.clips_dir.display(),
+        "Bals ejecutándose en la bandeja del sistema (clic derecho en el icono para opciones)"
+    );
+
+    // Bucle estándar de mensajes Win32.
+    let mut msg = MSG::default();
+    unsafe {
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    // Limpieza ordenada.
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID);
+    }
+    remove_tray_icon(hwnd);
+
+    TRAY_STATE.with(|slot| {
+        if let Some(st) = slot.borrow_mut().take() {
+            if st.custom_icons {
+                unsafe {
+                    let _ = DestroyIcon(st.icon_idle);
+                    let _ = DestroyIcon(st.icon_rec);
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_SAVE_CLIP_ID => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow().as_ref() {
+                    info!(hotkey = %st.cfg.save_clip_hotkey, "Hotkey presionada -> Guardando clip...");
+                    let _ = st.cmd_tx.send(EngineCommand::SaveClip);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_EVENTS_ID => {
+            process_engine_events();
+            LRESULT(0)
+        }
+        WM_TRAY_ICON => {
+            let event = (lparam.0 & 0xFFFF) as u32;
+            match event {
+                WM_RBUTTONUP => show_context_menu(hwnd),
+                WM_LBUTTONDBLCLK => spawn_or_focus_ui(),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_BALS_RELOAD_CONFIG => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow_mut().as_mut() {
+                    let new_cfg = AppConfig::load_or_create();
+                    if new_cfg.save_clip_hotkey != st.cfg.save_clip_hotkey {
+                        unsafe {
+                            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID);
+                        }
+                        register_save_hotkey(hwnd, &new_cfg.save_clip_hotkey);
+                    }
+                    st.cfg = new_cfg.clone();
+                    let _ = st.cmd_tx.send(EngineCommand::UpdateConfig(new_cfg));
+                }
+            });
+            LRESULT(0)
+        }
+        WM_BALS_TOGGLE_RECORD => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow().as_ref() {
+                    let _ = st.cmd_tx.send(EngineCommand::ToggleManual);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_BALS_SAVE_CLIP => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow().as_ref() {
+                    let _ = st.cmd_tx.send(EngineCommand::SaveClip);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_BALS_SHUTDOWN => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow().as_ref() {
+                    let _ = st.cmd_tx.send(EngineCommand::Shutdown);
+                }
+            });
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let cmd_id = wparam.0 & 0xFFFF;
+            handle_menu_command(hwnd, cmd_id);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn process_engine_events() {
+    TRAY_STATE.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(st) = borrow.as_ref() else {
+            return;
+        };
+
+        while let Ok(ev) = st.event_rx.try_recv() {
+            match ev {
+                EngineEvent::ClipSaved(stats) => {
+                    if st.cfg.sound_feedback {
+                        unsafe {
+                            let _ = MessageBeep(MB_OK);
+                        }
+                    }
+                    let mb = stats.file_bytes as f64 / (1024.0 * 1024.0);
+                    let filename = stats
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "clip.mp4".to_string());
+                    show_balloon(
+                        st.hwnd,
+                        "Bals — Clip guardado",
+                        &format!("{filename} ({:.1} s · {:.1} MB)", stats.clip_duration_secs, mb),
+                        false,
+                    );
+                }
+                EngineEvent::ClipFailed(reason) => {
+                    show_balloon(st.hwnd, "Bals", &reason, true);
+                }
+                EngineEvent::StatusChanged(status) => {
+                    let is_rec = !matches!(status.state, RecordingState::Idle);
+                    let icon = if is_rec { st.icon_rec } else { st.icon_idle };
+                    let tip = match &status.state {
+                        RecordingState::Idle => format!(
+                            "Bals — En espera (tecla: {})",
+                            st.cfg.save_clip_hotkey
+                        ),
+                        RecordingState::RecordingManual => format!(
+                            "Bals — Grabando monitor ({} {} | tecla: {})",
+                            st.cfg.resolution, st.cfg.fps, st.cfg.save_clip_hotkey
+                        ),
+                        RecordingState::RecordingGame { exe_name, .. } => format!(
+                            "Bals — Grabando {exe_name} (tecla: {})",
+                            st.cfg.save_clip_hotkey
+                        ),
+                    };
+                    update_tray_icon(st.hwnd, icon, &tip);
+                }
+            }
+        }
+    });
+}
+
+fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
+    TRAY_STATE.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let Some(st) = borrow.as_mut() else {
+            return;
+        };
+
+        let mut config_changed = false;
+
+        match cmd_id {
+            IDM_OPEN_UI => spawn_or_focus_ui(),
+            IDM_SAVE_CLIP => {
+                let _ = st.cmd_tx.send(EngineCommand::SaveClip);
+            }
+            IDM_TOGGLE_RECORD => {
+                let _ = st.cmd_tx.send(EngineCommand::ToggleManual);
+            }
+            IDM_TOGGLE_AUTODETECT => {
+                st.cfg.capture_mode = match st.cfg.capture_mode {
+                    CaptureMode::AutoDetectGames => CaptureMode::ManualMonitor,
+                    CaptureMode::ManualMonitor => CaptureMode::AutoDetectGames,
+                };
+                config_changed = true;
+            }
+            IDM_RES_720 => {
+                st.cfg.resolution = Resolution::P720;
+                config_changed = true;
+            }
+            IDM_RES_1080 => {
+                st.cfg.resolution = Resolution::P1080;
+                config_changed = true;
+            }
+            IDM_RES_1440 => {
+                st.cfg.resolution = Resolution::P1440;
+                config_changed = true;
+            }
+            IDM_FPS_30 => {
+                st.cfg.fps = FrameRate::Fps30;
+                config_changed = true;
+            }
+            IDM_FPS_60 => {
+                st.cfg.fps = FrameRate::Fps60;
+                config_changed = true;
+            }
+            IDM_DUR_15 => {
+                st.cfg.replay_duration = ReplayDuration::Sec15;
+                config_changed = true;
+            }
+            IDM_DUR_30 => {
+                st.cfg.replay_duration = ReplayDuration::Sec30;
+                config_changed = true;
+            }
+            IDM_DUR_60 => {
+                st.cfg.replay_duration = ReplayDuration::Sec60;
+                config_changed = true;
+            }
+            IDM_DUR_120 => {
+                st.cfg.replay_duration = ReplayDuration::Sec120;
+                config_changed = true;
+            }
+            IDM_TOGGLE_MIC => {
+                st.cfg.mic_enabled = !st.cfg.mic_enabled;
+                config_changed = true;
+            }
+            IDM_OPEN_CLIPS => {
+                let _ = std::fs::create_dir_all(&st.cfg.clips_dir);
+                open_in_shell(&st.cfg.clips_dir);
+            }
+            IDM_OPEN_CONFIG => {
+                let _ = st.cfg.save();
+                open_in_shell(&AppConfig::config_path());
+            }
+            IDM_EXIT => {
+                let _ = st.cmd_tx.send(EngineCommand::Shutdown);
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+            _ => {}
+        }
+
+        if config_changed {
+            let _ = st.cmd_tx.send(EngineCommand::UpdateConfig(st.cfg.clone()));
+        }
+    });
+}
+
+fn show_context_menu(hwnd: HWND) {
+    TRAY_STATE.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(st) = borrow.as_ref() else {
+            return;
+        };
+
+        let status = st.status.lock().map(|g| g.clone()).unwrap_or_default();
+        let is_recording = !matches!(status.state, RecordingState::Idle);
+
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+
+            let header = match &status.state {
+                RecordingState::Idle => "Bals — En espera (0% GPU)".to_string(),
+                RecordingState::RecordingManual => format!(
+                    "● Grabando monitor ({:.0}s · {:.1} MB RAM)",
+                    status.buffered_secs, status.buffer_ram_mb
+                ),
+                RecordingState::RecordingGame { exe_name, .. } => format!(
+                    "● {exe_name} ({:.0}s · {:.1} MB RAM)",
+                    status.buffered_secs, status.buffer_ram_mb
+                ),
+            };
+            append_text(menu, MF_STRING | MF_GRAYED, 0, &header);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            append_text(menu, MF_STRING, IDM_OPEN_UI, "Abrir Bals (Ajustes y Clips)");
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+            let save_label = format!(
+                "Guardar últimos {}s   [{}]",
+                st.cfg.replay_duration.as_secs(),
+                st.cfg.save_clip_hotkey
+            );
+            append_text(
+                menu,
+                if is_recording {
+                    MF_STRING
+                } else {
+                    MF_STRING | MF_GRAYED
+                },
+                IDM_SAVE_CLIP,
+                &save_label,
+            );
+
+            let toggle_label = if is_recording {
+                "Pausar Replay Buffer"
+            } else {
+                "Iniciar Replay Buffer (Monitor)"
+            };
+            append_text(menu, MF_STRING, IDM_TOGGLE_RECORD, toggle_label);
+
+            let auto_flag = if st.cfg.capture_mode == CaptureMode::AutoDetectGames {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            };
+            append_text(
+                menu,
+                auto_flag,
+                IDM_TOGGLE_AUTODETECT,
+                "Detectar juegos automáticamente",
+            );
+
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+            // Submenú Resolución
+            if let Ok(sub_res) = CreatePopupMenu() {
+                append_checked(
+                    sub_res,
+                    st.cfg.resolution == Resolution::P720,
+                    IDM_RES_720,
+                    "720p (1280x720) — Ultra liviano",
+                );
+                append_checked(
+                    sub_res,
+                    st.cfg.resolution == Resolution::P1080,
+                    IDM_RES_1080,
+                    "1080p (1920x1080) — Recomendado",
+                );
+                append_checked(
+                    sub_res,
+                    st.cfg.resolution == Resolution::P1440,
+                    IDM_RES_1440,
+                    "2K (2560x1440)",
+                );
+                let label = HSTRING::from(format!("Resolución ({})", st.cfg.resolution));
+                let _ = AppendMenuW(menu, MF_POPUP, sub_res.0 as usize, &label);
+            }
+
+            // Submenú FPS
+            if let Ok(sub_fps) = CreatePopupMenu() {
+                append_checked(sub_fps, st.cfg.fps == FrameRate::Fps30, IDM_FPS_30, "30 fps");
+                append_checked(sub_fps, st.cfg.fps == FrameRate::Fps60, IDM_FPS_60, "60 fps");
+                let label = HSTRING::from(format!("Cuadros ({})", st.cfg.fps));
+                let _ = AppendMenuW(menu, MF_POPUP, sub_fps.0 as usize, &label);
+            }
+
+            // Submenú Duración
+            if let Ok(sub_dur) = CreatePopupMenu() {
+                append_checked(
+                    sub_dur,
+                    st.cfg.replay_duration == ReplayDuration::Sec15,
+                    IDM_DUR_15,
+                    "Últimos 15 segundos",
+                );
+                append_checked(
+                    sub_dur,
+                    st.cfg.replay_duration == ReplayDuration::Sec30,
+                    IDM_DUR_30,
+                    "Últimos 30 segundos",
+                );
+                append_checked(
+                    sub_dur,
+                    st.cfg.replay_duration == ReplayDuration::Sec60,
+                    IDM_DUR_60,
+                    "Últimos 60 segundos",
+                );
+                append_checked(
+                    sub_dur,
+                    st.cfg.replay_duration == ReplayDuration::Sec120,
+                    IDM_DUR_120,
+                    "Últimos 120 segundos",
+                );
+                let label = HSTRING::from(format!("Duración clip ({})", st.cfg.replay_duration));
+                let _ = AppendMenuW(menu, MF_POPUP, sub_dur.0 as usize, &label);
+            }
+
+            append_checked(menu, st.cfg.mic_enabled, IDM_TOGGLE_MIC, "Grabar micrófono");
+
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            append_text(menu, MF_STRING, IDM_OPEN_CLIPS, "Abrir carpeta de clips");
+            append_text(menu, MF_STRING, IDM_OPEN_CONFIG, "Editar config.toml");
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            append_text(menu, MF_STRING, IDM_EXIT, "Salir de Bals");
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = TrackPopupMenu(
+                menu,
+                TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                pt.x,
+                pt.y,
+                None,
+                hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+        }
+    });
+}
+
+unsafe fn append_text(
+    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS,
+    id: usize,
+    text: &str,
+) {
+    let wide = HSTRING::from(text);
+    let _ = unsafe { AppendMenuW(menu, flags, id, &wide) };
+}
+
+unsafe fn append_checked(
+    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    checked: bool,
+    id: usize,
+    text: &str,
+) {
+    let flags = if checked {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING | MF_UNCHECKED
+    };
+    unsafe { append_text(menu, flags, id, text) };
+}
+
+fn register_save_hotkey(hwnd: HWND, spec: &str) {
+    match parse_hotkey(spec) {
+        Ok(parsed) => {
+            if let Err(err) = unsafe {
+                RegisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID, parsed.modifiers, parsed.vk)
+            } {
+                warn!(hotkey = %spec, "No se pudo registrar hotkey global ({err}); puede estar en uso por otra app");
+            } else {
+                info!(hotkey = %spec, vk = format!("0x{:02X}", parsed.vk), "Hotkey global registrada");
+            }
+        }
+        Err(err) => warn!("Hotkey '{spec}' inválida: {err:#}"),
+    }
+}
+
+fn add_tray_icon(hwnd: HWND, icon: HICON, cfg: &AppConfig) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_UID,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAY_ICON,
+        hIcon: icon,
+        ..Default::default()
+    };
+    copy_utf16(
+        &mut nid.szTip,
+        &format!("Bals — En espera (tecla: {})", cfg.save_clip_hotkey),
+    );
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+}
+
+fn update_tray_icon(hwnd: HWND, icon: HICON, tooltip: &str) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_UID,
+        uFlags: NIF_ICON | NIF_TIP,
+        hIcon: icon,
+        ..Default::default()
+    };
+    copy_utf16(&mut nid.szTip, tooltip);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+fn show_balloon(hwnd: HWND, title: &str, body: &str, is_warning: bool) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_UID,
+        uFlags: NIF_INFO,
+        dwInfoFlags: if is_warning { NIIF_WARNING } else { NIIF_INFO },
+        ..Default::default()
+    };
+    copy_utf16(&mut nid.szInfoTitle, title);
+    copy_utf16(&mut nid.szInfo, body);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+fn remove_tray_icon(hwnd: HWND) {
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_UID,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+fn open_in_shell(path: &Path) {
+    let target = HSTRING::from(path.as_os_str());
+    unsafe {
+        ShellExecuteW(None, w!("open"), &target, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+fn copy_utf16(dst: &mut [u16], src: &str) {
+    dst.fill(0);
+    let max_len = dst.len().saturating_sub(1);
+    for (slot, ch) in dst.iter_mut().take(max_len).zip(src.encode_utf16()) {
+        *slot = ch;
+    }
+}
+
+/// Genera dos iconos 16x16 nítidos en memoria (verde esmeralda = espera, rojo = grabando)
+/// para evitar depender de archivos `.ico` externos.
+fn create_status_icons() -> (HICON, HICON, bool) {
+    let idle = build_circle_icon(34, 197, 94); // verde esmeralda
+    let rec = build_circle_icon(239, 68, 68); // rojo grabación
+    match (idle, rec) {
+        (Ok(i), Ok(r)) => (i, r, true),
+        _ => {
+            let fallback = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() };
+            (fallback, fallback, false)
+        }
+    }
+}
+
+fn build_circle_icon(r: u8, g: u8, b: u8) -> Result<HICON> {
+    const SIZE: usize = 16;
+    let mut color_bgra = vec![0u8; SIZE * SIZE * 4];
+    let mut and_mask = vec![0xFFu8; SIZE * (SIZE / 8)];
+
+    let center = (SIZE as f32 - 1.0) / 2.0;
+    let radius = 6.2f32;
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let idx = (y * SIZE + x) * 4;
+            if dist <= radius {
+                // Borde blanco suave alrededor del círculo para visibilidad en barra clara u oscura.
+                if dist > radius - 1.2 {
+                    color_bgra[idx] = 240;
+                    color_bgra[idx + 1] = 240;
+                    color_bgra[idx + 2] = 240;
+                    color_bgra[idx + 3] = 255;
+                } else {
+                    color_bgra[idx] = b;
+                    color_bgra[idx + 1] = g;
+                    color_bgra[idx + 2] = r;
+                    color_bgra[idx + 3] = 255;
+                }
+                // Bit 0 en AND mask = píxel opaco visible.
+                let mask_byte = y * (SIZE / 8) + (x / 8);
+                let mask_bit = 7 - (x % 8);
+                and_mask[mask_byte] &= !(1u8 << mask_bit);
+            }
+        }
+    }
+
+    let icon = unsafe {
+        CreateIcon(
+            None,
+            SIZE as i32,
+            SIZE as i32,
+            1,
+            32,
+            and_mask.as_ptr(),
+            color_bgra.as_ptr(),
+        )
+    }?;
+    Ok(icon)
+}
