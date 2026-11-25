@@ -55,8 +55,10 @@ fn post_to_daemon(msg: u32) -> bool {
 /// Abre la ventana nativa liviana (`bals.exe --ui`) como proceso independiente de corta vida.
 /// Si ya está abierta, la trae al frente; al cerrarla, el SO libera el 100% de su RAM y contexto GPU.
 pub fn spawn_or_focus_ui() {
+    let tray_hwnd = unsafe { FindWindowW(TRAY_WINDOW_CLASS, PCWSTR::null()) }.ok();
+
     if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), UI_WINDOW_TITLE) } {
-        if !hwnd.is_invalid() {
+        if !hwnd.is_invalid() && Some(hwnd) != tray_hwnd {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
                 let _ = SetForegroundWindow(hwnd);

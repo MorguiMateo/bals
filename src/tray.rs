@@ -95,7 +95,7 @@ pub fn run_tray_loop(
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("Bals"),
+            w!("BalsTrayDaemon"),
             WINDOW_STYLE(0),
             0,
             0,
