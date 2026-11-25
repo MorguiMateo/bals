@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_APP,
+    FindWindowW, PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_APP, WM_CLOSE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -154,6 +154,18 @@ pub fn notify_save_clip() -> bool {
 /// Solicita al daemon cerrarse ordenadamente (usado al aplicar una actualización automática).
 pub fn notify_shutdown() -> bool {
     post_to_daemon(WM_BALS_SHUTDOWN)
+}
+
+/// Cierra ordenadamente la ventana de escritorio (`bals.exe --ui`) si está abierta.
+pub fn close_ui_window() {
+    let tray_hwnd = unsafe { FindWindowW(TRAY_WINDOW_CLASS, PCWSTR::null()) }.ok();
+    if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), UI_WINDOW_TITLE) } {
+        if !hwnd.is_invalid() && Some(hwnd) != tray_hwnd {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
 }
 
 fn post_to_daemon(msg: u32) -> bool {

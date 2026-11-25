@@ -467,10 +467,26 @@ impl AppConfig {
                 .with_context(|| format!("No se pudo crear {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Error serializando config.toml")?;
-        std::fs::write(&path, content)
+        write_atomic(&path, content.as_bytes())
             .with_context(|| format!("No se pudo guardar {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Escritura atómica vía archivo temporal + `rename` para evitar lecturas parciales en carrera
+/// cuando `--ui` guarda `config.toml` y el daemon en bandeja lo recarga al instante.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, bytes)?;
+    if std::fs::rename(&tmp, path).is_err() {
+        // En Windows, si el destino existe y rename falla transitoriamente, reintentamos o caemos a write.
+        let _ = std::fs::remove_file(path);
+        if std::fs::rename(&tmp, path).is_err() {
+            std::fs::write(path, bytes)?;
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok(())
 }
 
 fn default_clips_dir() -> PathBuf {

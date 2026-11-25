@@ -7,8 +7,14 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 use windows::Win32::Networking::WinHttp::{
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WinHttpCloseHandle, WinHttpConnect,
-    WinHttpOpen, WinHttpOpenRequest, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WINHTTP_ACCESS_TYPE, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_REFRESH,
+    WINHTTP_FLAG_SECURE, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2,
+    WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3, WINHTTP_OPTION_DISABLE_FEATURE,
+    WINHTTP_OPTION_SECURE_PROTOCOLS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION,
+    WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen,
+    WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -57,16 +63,18 @@ pub fn cleanup_old_binary() {
     }
 }
 
-/// Consulta `https://api.github.com/repos/sconelli24/bals/releases/latest` usando WinHTTP nativo
-/// (sin OpenSSL ni crates HTTP externos) y devuelve `Some(ReleaseInfo)` si existe una versión mayor.
+/// Consulta el último release en GitHub usando WinHTTP nativo con **TLS 1.2 explícito**
+/// (imprescindible en Windows 10) y estrategia dual:
+/// 1. Redirección `https://github.com/sconelli24/bals/releases/latest` (sin rate-limit de 60 req/h).
+/// 2. Fallback a `https://api.github.com/repos/sconelli24/bals/releases/latest`.
 pub fn check_latest_release() -> Result<Option<ReleaseInfo>> {
-    let api_path = format!("/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
-    let body = https_get_bytes("api.github.com", &api_path, 512 * 1024)
-        .context("No se pudo consultar el último release en GitHub")?;
-
-    let json = String::from_utf8_lossy(&body);
-    let Some(info) = parse_github_release_json(&json) else {
-        return Ok(None);
+    let info = match check_via_github_redirect() {
+        Ok(Some(info)) => info,
+        Ok(None) => check_via_github_api()?,
+        Err(redir_err) => {
+            debug!("Comprobación vía redirect falló ({redir_err:#}); probando GitHub API");
+            check_via_github_api()?
+        }
     };
 
     if is_newer_version(&info.version, CURRENT_VERSION) {
@@ -76,13 +84,31 @@ pub fn check_latest_release() -> Result<Option<ReleaseInfo>> {
     }
 }
 
-/// Descarga el nuevo `bals.exe`, verifica su cabecera PE (`MZ`), reemplaza el binario en ejecución
-/// (renombrando el actual a `.old`), lanza la nueva versión y devuelve `Ok(())` para que el proceso actual cierre.
-pub fn download_and_apply_update(info: &ReleaseInfo, launch_args: &[&str]) -> Result<()> {
-    let current_exe = std::env::current_exe().context("No se pudo resolver current_exe")?;
-    let new_exe = current_exe.with_extension("exe.new");
-    let old_exe = current_exe.with_extension("exe.old");
+fn check_via_github_redirect() -> Result<Option<ReleaseInfo>> {
+    let path = format!("/{REPO_OWNER}/{REPO_NAME}/releases/latest");
+    let (status, location) = https_head_redirect("github.com", &path)?;
+    if matches!(status, 301 | 302 | 303 | 307 | 308) {
+        if let Some(loc) = location {
+            if let Some(info) = parse_release_redirect_location(&loc) {
+                return Ok(Some(info));
+            }
+        }
+    }
+    Ok(None)
+}
 
+fn check_via_github_api() -> Result<ReleaseInfo> {
+    let api_path = format!("/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
+    let body = https_get_bytes("api.github.com", &api_path, 512 * 1024)
+        .context("No se pudo consultar el último release en GitHub API")?;
+
+    let json = String::from_utf8_lossy(&body);
+    parse_github_release_json(&json)
+        .context("La respuesta de GitHub Releases no contenía un asset bals.exe válido")
+}
+
+/// Descarga y valida la cabecera PE (`MZ`) del nuevo `bals.exe` en memoria, sin cerrar aún el daemon.
+pub fn download_update_bytes(info: &ReleaseInfo) -> Result<Vec<u8>> {
     let (host, path) = split_https_url(&info.download_url)
         .context("URL de descarga inválida en el release de GitHub")?;
 
@@ -104,7 +130,21 @@ pub fn download_and_apply_update(info: &ReleaseInfo, launch_args: &[&str]) -> Re
         );
     }
 
-    write_file_atomic(&new_exe, &bytes)?;
+    Ok(bytes)
+}
+
+/// Reemplaza el binario en ejecución (renombrando el actual a `.old`) con `bytes` ya descargados
+/// y relanza la nueva versión.
+pub fn apply_downloaded_update(
+    bytes: &[u8],
+    info: &ReleaseInfo,
+    launch_args: &[&str],
+) -> Result<()> {
+    let current_exe = std::env::current_exe().context("No se pudo resolver current_exe")?;
+    let new_exe = current_exe.with_extension("exe.new");
+    let old_exe = current_exe.with_extension("exe.old");
+
+    write_file_atomic(&new_exe, bytes)?;
 
     // Windows permite renombrar un .exe mientras está en ejecución.
     let _ = std::fs::remove_file(&old_exe);
@@ -130,6 +170,13 @@ pub fn download_and_apply_update(info: &ReleaseInfo, launch_args: &[&str]) -> Re
     Ok(())
 }
 
+/// Descarga el nuevo `bals.exe`, verifica su cabecera PE (`MZ`), reemplaza el binario en ejecución
+/// y relanza la nueva versión.
+pub fn download_and_apply_update(info: &ReleaseInfo, launch_args: &[&str]) -> Result<()> {
+    let bytes = download_update_bytes(info)?;
+    apply_downloaded_update(&bytes, info, launch_args)
+}
+
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = File::create(path)
         .with_context(|| format!("No se pudo crear archivo temporal {}", path.display()))?;
@@ -138,13 +185,15 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn https_get_bytes(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+/// Abre una sesión WinHTTP configurando explícitamente TLS 1.2 (y TLS 1.3 si el SO lo soporta)
+/// más timeouts razonables para evitar bloqueos y fallos TLS en Windows 10.
+fn open_winhttp_session(proxy_access_type: WINHTTP_ACCESS_TYPE) -> Result<WinHttpHandle> {
     let agent = HSTRING::from(format!("Bals/{CURRENT_VERSION}"));
     let session = WinHttpHandle::new(
         unsafe {
             WinHttpOpen(
                 &agent,
-                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                proxy_access_type,
                 PCWSTR::null(),
                 PCWSTR::null(),
                 0,
@@ -152,6 +201,172 @@ fn https_get_bytes(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>> 
         },
         "WinHttpOpen",
     )?;
+
+    // Forzar TLS 1.2+ (en Windows 10 WinHTTP a menudo deja solo TLS 1.0/1.1 por defecto y GitHub lo rechaza).
+    // Si Windows 10 rechaza la bandera TLS 1.3 con ERROR_INVALID_PARAMETER, reintentar solo con TLS 1.2.
+    let tls12_13: u32 =
+        WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    let ok_12_13 = unsafe {
+        WinHttpSetOption(
+            Some(session.0),
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            Some(&tls12_13.to_ne_bytes()),
+        )
+    }
+    .is_ok();
+
+    if !ok_12_13 {
+        let tls12: u32 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        let _ = unsafe {
+            WinHttpSetOption(
+                Some(session.0),
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                Some(&tls12.to_ne_bytes()),
+            )
+        };
+    }
+
+    let _ = unsafe { WinHttpSetTimeouts(session.0, 8_000, 8_000, 15_000, 30_000) };
+
+    Ok(session)
+}
+
+fn query_http_status_code(request: *mut c_void) -> Result<u32> {
+    let mut status = 0u32;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some((&mut status as *mut u32).cast::<c_void>()),
+            &mut len,
+            std::ptr::null_mut(),
+        )
+    }
+    .context("WinHttpQueryHeaders (STATUS_CODE) falló")?;
+    Ok(status)
+}
+
+fn query_location_header(request: *mut c_void) -> Option<String> {
+    let mut buf = [0u16; 512];
+    let mut byte_len = (buf.len() * 2) as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_LOCATION,
+            PCWSTR::null(),
+            Some(buf.as_mut_ptr().cast::<c_void>()),
+            &mut byte_len,
+            std::ptr::null_mut(),
+        )
+    }
+    .ok()?;
+    let u16_len = (byte_len as usize / 2).min(buf.len());
+    let nul = buf[..u16_len].iter().position(|&c| c == 0).unwrap_or(u16_len);
+    Some(String::from_utf16_lossy(&buf[..nul]))
+}
+
+/// Consulta `HEAD` sin seguir redirecciones para leer la cabecera `Location` en ~80 ms.
+fn https_head_redirect(host: &str, path: &str) -> Result<(u32, Option<String>)> {
+    let proxy_modes = [
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+    ];
+    let mut last_err = None;
+    for proxy_mode in proxy_modes {
+        match https_head_redirect_once(host, path, proxy_mode) {
+            Ok(res) => return Ok(res),
+            Err(err) => {
+                debug!(
+                    proxy_mode = proxy_mode.0,
+                    "HEAD WinHTTP falló ({err:#}); probando siguiente modo proxy"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Error consultando redirección HTTPS")))
+}
+
+fn https_head_redirect_once(
+    host: &str,
+    path: &str,
+    proxy_mode: WINHTTP_ACCESS_TYPE,
+) -> Result<(u32, Option<String>)> {
+    let session = open_winhttp_session(proxy_mode)?;
+    let host_w = HSTRING::from(host);
+    let connect = WinHttpHandle::new(
+        unsafe { WinHttpConnect(session.0, &host_w, 443, 0) },
+        "WinHttpConnect",
+    )?;
+
+    let verb = HSTRING::from("HEAD");
+    let path_w = HSTRING::from(path);
+    let request = WinHttpHandle::new(
+        unsafe {
+            WinHttpOpenRequest(
+                connect.0,
+                &verb,
+                &path_w,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                std::ptr::null(),
+                WINHTTP_FLAG_SECURE | WINHTTP_FLAG_REFRESH,
+            )
+        },
+        "WinHttpOpenRequest",
+    )?;
+
+    let disable_redir: u32 = WINHTTP_DISABLE_REDIRECTS;
+    let _ = unsafe {
+        WinHttpSetOption(
+            Some(request.0),
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            Some(&disable_redir.to_ne_bytes()),
+        )
+    };
+
+    unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }
+        .context("WinHttpSendRequest (HEAD) falló")?;
+    unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }
+        .context("WinHttpReceiveResponse (HEAD) falló")?;
+
+    let status = query_http_status_code(request.0)?;
+    let location = query_location_header(request.0);
+    Ok((status, location))
+}
+
+fn https_get_bytes(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let proxy_modes = [
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+    ];
+    let mut last_err = None;
+    for proxy_mode in proxy_modes {
+        match https_get_bytes_once(host, path, max_bytes, proxy_mode) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                debug!(
+                    proxy_mode = proxy_mode.0,
+                    "GET WinHTTP falló ({err:#}); probando siguiente modo proxy"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Error realizando petición HTTPS")))
+}
+
+fn https_get_bytes_once(
+    host: &str,
+    path: &str,
+    max_bytes: usize,
+    proxy_mode: WINHTTP_ACCESS_TYPE,
+) -> Result<Vec<u8>> {
+    let session = open_winhttp_session(proxy_mode)?;
 
     let host_w = HSTRING::from(host);
     let connect = WinHttpHandle::new(
@@ -170,7 +385,7 @@ fn https_get_bytes(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>> 
                 PCWSTR::null(),
                 PCWSTR::null(),
                 std::ptr::null(),
-                WINHTTP_FLAG_SECURE,
+                WINHTTP_FLAG_SECURE | WINHTTP_FLAG_REFRESH,
             )
         },
         "WinHttpOpenRequest",
@@ -185,6 +400,11 @@ fn https_get_bytes(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>> 
 
     unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }
         .context("WinHttpReceiveResponse falló")?;
+
+    let status = query_http_status_code(request.0)?;
+    if status != 200 {
+        bail!("GitHub respondió HTTP {status} para https://{host}{path}");
+    }
 
     let mut out = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 32 * 1024];
@@ -211,6 +431,28 @@ fn https_get_bytes(host: &str, path: &str, max_bytes: usize) -> Result<Vec<u8>> 
     }
 
     Ok(out)
+}
+
+/// Parsea una cabecera `Location` como `https://github.com/sconelli24/bals/releases/tag/v0.5.3`
+/// y deriva la URL directa de descarga de `bals.exe`.
+fn parse_release_redirect_location(location: &str) -> Option<ReleaseInfo> {
+    let idx = location.find("/releases/tag/")?;
+    let raw_tag = location[idx + "/releases/tag/".len()..]
+        .split(['?', '#', '/'])
+        .next()?
+        .trim();
+    if raw_tag.is_empty() {
+        return None;
+    }
+    let version = raw_tag.trim_start_matches(['v', 'V']).to_string();
+    parse_semver(&version)?;
+    let download_url = format!(
+        "https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{raw_tag}/bals.exe"
+    );
+    Some(ReleaseInfo {
+        version,
+        download_url,
+    })
 }
 
 fn split_https_url(url: &str) -> Option<(String, String)> {
@@ -320,5 +562,19 @@ mod tests {
             info.download_url,
             "https://github.com/sconelli24/bals/releases/download/v0.2.0/bals.exe"
         );
+    }
+
+    #[test]
+    fn parses_github_redirect_location() {
+        let info = parse_release_redirect_location(
+            "https://github.com/sconelli24/bals/releases/tag/v0.5.3",
+        )
+        .expect("debería parsear redirect");
+        assert_eq!(info.version, "0.5.3");
+        assert_eq!(
+            info.download_url,
+            "https://github.com/sconelli24/bals/releases/download/v0.5.3/bals.exe"
+        );
+        assert!(parse_release_redirect_location("https://github.com/sconelli24/bals/releases").is_none());
     }
 }

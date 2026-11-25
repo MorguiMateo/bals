@@ -31,7 +31,7 @@ use crate::engine::{EngineCommand, EngineEvent, EngineStatus, RecordingState};
 use crate::hotkey::parse_hotkey;
 use crate::ipc::{
     TRAY_WINDOW_CLASS, WM_BALS_RELOAD_CONFIG, WM_BALS_SAVE_CLIP, WM_BALS_SHUTDOWN,
-    WM_BALS_TOGGLE_RECORD, spawn_or_focus_ui,
+    WM_BALS_TOGGLE_RECORD, close_ui_window, spawn_or_focus_ui,
 };
 
 const WM_TRAY_ICON: u32 = WM_APP + 1;
@@ -65,6 +65,7 @@ const IDM_EXIT: usize = 1099;
 struct TrayState {
     hwnd: HWND,
     cfg: AppConfig,
+    hotkey_registered: bool,
     cmd_tx: Sender<EngineCommand>,
     event_rx: Receiver<EngineEvent>,
     status: Arc<Mutex<EngineStatus>>,
@@ -116,7 +117,7 @@ pub fn run_tray_loop(
     .context("CreateWindowExW (Bals Tray) falló")?;
 
     // Registrar atajo global (por defecto `\`).
-    register_save_hotkey(hwnd, &cfg.save_clip_hotkey);
+    let hotkey_registered = register_save_hotkey(hwnd, &cfg.save_clip_hotkey).is_ok();
 
     // Crear iconos programáticos (verde = en espera, rojo = grabando) sin archivos .ico externos.
     let (icon_idle, icon_rec, custom_icons) = create_status_icons();
@@ -133,6 +134,7 @@ pub fn run_tray_loop(
         *slot.borrow_mut() = Some(TrayState {
             hwnd,
             cfg: cfg.clone(),
+            hotkey_registered,
             cmd_tx,
             event_rx,
             status,
@@ -209,15 +211,50 @@ unsafe extern "system" fn wnd_proc(
         WM_BALS_RELOAD_CONFIG => {
             TRAY_STATE.with(|slot| {
                 if let Some(st) = slot.borrow_mut().as_mut() {
-                    let new_cfg = AppConfig::load_or_create();
-                    if new_cfg.save_clip_hotkey != st.cfg.save_clip_hotkey {
+                    let mut new_cfg = AppConfig::load_or_create();
+                    let prev_hotkey = st.cfg.save_clip_hotkey.clone();
+                    let hotkey_changed = new_cfg.save_clip_hotkey != prev_hotkey;
+
+                    if hotkey_changed || !st.hotkey_registered {
                         unsafe {
                             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID);
                         }
-                        register_save_hotkey(hwnd, &new_cfg.save_clip_hotkey);
+                        match register_save_hotkey(hwnd, &new_cfg.save_clip_hotkey) {
+                            Ok(()) => {
+                                st.hotkey_registered = true;
+                            }
+                            Err(err) => {
+                                // Si falló registrar la nueva tecla, restaurar la anterior para no dejar sin atajo.
+                                warn!(
+                                    failed_hotkey = %new_cfg.save_clip_hotkey,
+                                    fallback_hotkey = %prev_hotkey,
+                                    "No se pudo registrar el nuevo atajo ({err:#}); restaurando atajo anterior"
+                                );
+                                st.hotkey_registered =
+                                    register_save_hotkey(hwnd, &prev_hotkey).is_ok();
+                                let failed_spec = new_cfg.save_clip_hotkey.clone();
+                                new_cfg.save_clip_hotkey = prev_hotkey;
+                                let _ = new_cfg.save();
+                                show_balloon(
+                                    hwnd,
+                                    "Bals — Atajo en uso",
+                                    &format!(
+                                        "No se pudo registrar [{failed_spec}] (en uso por otra app). Se mantuvo [{}].",
+                                        new_cfg.save_clip_hotkey
+                                    ),
+                                    true,
+                                );
+                            }
+                        }
                     }
+
                     st.cfg = new_cfg.clone();
-                    let _ = st.cmd_tx.send(EngineCommand::UpdateConfig(new_cfg));
+                    let cur_status = st.status.lock().map(|g| g.clone()).unwrap_or_default();
+                    refresh_tray_icon_for_status(st, &cur_status);
+                    let _ = st.cmd_tx.send(EngineCommand::UpdateConfig {
+                        config: new_cfg,
+                        persist_to_disk: false,
+                    });
                 }
             });
             LRESULT(0)
@@ -294,36 +331,7 @@ fn process_engine_events() {
                     show_balloon(st.hwnd, "Bals", &reason, true);
                 }
                 EngineEvent::StatusChanged(status) => {
-                    let is_rec = !matches!(status.state, RecordingState::Idle);
-                    let icon = if is_rec { st.icon_rec } else { st.icon_idle };
-                    let tip = match &status.state {
-                        RecordingState::Idle => format!(
-                            "Bals — En espera (tecla: {})",
-                            st.cfg.save_clip_hotkey
-                        ),
-                        RecordingState::RecordingManual { monitor_label } => format!(
-                            "Bals — Grabando {monitor_label} ({} {} | tecla: {})",
-                            st.cfg.resolution, st.cfg.fps, st.cfg.save_clip_hotkey
-                        ),
-                        RecordingState::RecordingGame {
-                            exe_name,
-                            paused_alt_tab,
-                            ..
-                        } => {
-                            if *paused_alt_tab {
-                                format!(
-                                    "Bals — {exe_name} en pausa (Alt-Tab · buffer intacto | tecla: {})",
-                                    st.cfg.save_clip_hotkey
-                                )
-                            } else {
-                                format!(
-                                    "Bals — Grabando {exe_name} (tecla: {})",
-                                    st.cfg.save_clip_hotkey
-                                )
-                            }
-                        }
-                    };
-                    update_tray_icon(st.hwnd, icon, &tip);
+                    refresh_tray_icon_for_status(st, &status);
                 }
             }
         }
@@ -422,6 +430,7 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
                 open_in_shell(&AppConfig::config_path());
             }
             IDM_EXIT => {
+                close_ui_window();
                 let _ = st.cmd_tx.send(EngineCommand::Shutdown);
                 unsafe {
                     let _ = DestroyWindow(hwnd);
@@ -431,7 +440,10 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
         }
 
         if config_changed {
-            let _ = st.cmd_tx.send(EngineCommand::UpdateConfig(st.cfg.clone()));
+            let _ = st.cmd_tx.send(EngineCommand::UpdateConfig {
+                config: st.cfg.clone(),
+                persist_to_disk: true,
+            });
         }
     });
 }
@@ -658,19 +670,51 @@ unsafe fn append_checked(
     unsafe { append_text(menu, flags, id, text) };
 }
 
-fn register_save_hotkey(hwnd: HWND, spec: &str) {
-    match parse_hotkey(spec) {
-        Ok(parsed) => {
-            if let Err(err) = unsafe {
-                RegisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID, parsed.modifiers, parsed.vk)
-            } {
-                warn!(hotkey = %spec, "No se pudo registrar hotkey global ({err}); puede estar en uso por otra app");
+fn refresh_tray_icon_for_status(st: &TrayState, status: &EngineStatus) {
+    let is_rec = !matches!(status.state, RecordingState::Idle);
+    let icon = if is_rec { st.icon_rec } else { st.icon_idle };
+    let tip = match &status.state {
+        RecordingState::Idle => format!(
+            "Bals — En espera (tecla: {})",
+            st.cfg.save_clip_hotkey
+        ),
+        RecordingState::RecordingManual { monitor_label } => format!(
+            "Bals — Grabando {monitor_label} ({} {} | tecla: {})",
+            st.cfg.resolution, st.cfg.fps, st.cfg.save_clip_hotkey
+        ),
+        RecordingState::RecordingGame {
+            exe_name,
+            paused_alt_tab,
+            ..
+        } => {
+            if *paused_alt_tab {
+                format!(
+                    "Bals — {exe_name} en pausa (Alt-Tab · buffer intacto | tecla: {})",
+                    st.cfg.save_clip_hotkey
+                )
             } else {
-                info!(hotkey = %spec, vk = format!("0x{:02X}", parsed.vk), "Hotkey global registrada");
+                format!(
+                    "Bals — Grabando {exe_name} (tecla: {})",
+                    st.cfg.save_clip_hotkey
+                )
             }
         }
-        Err(err) => warn!("Hotkey '{spec}' inválida: {err:#}"),
-    }
+    };
+    update_tray_icon(st.hwnd, icon, &tip);
+}
+
+fn register_save_hotkey(hwnd: HWND, spec: &str) -> Result<()> {
+    let parsed = parse_hotkey(spec)?;
+    unsafe { RegisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID, parsed.modifiers, parsed.vk) }
+        .with_context(|| {
+            format!("RegisterHotKey rechazó '{spec}' (puede estar en uso por otra app)")
+        })?;
+    info!(
+        hotkey = %spec,
+        vk = format!("0x{:02X}", parsed.vk),
+        "Hotkey global registrada"
+    );
+    Ok(())
 }
 
 fn add_tray_icon(hwnd: HWND, icon: HICON, cfg: &AppConfig) {

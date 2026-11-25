@@ -42,7 +42,11 @@ pub enum EngineCommand {
     Stop,
     ToggleManual,
     SaveClip,
-    UpdateConfig(AppConfig),
+    /// Actualiza la configuración en vivo. `persist_to_disk` es `false` cuando `--ui` ya la guardó.
+    UpdateConfig {
+        config: AppConfig,
+        persist_to_disk: bool,
+    },
     Shutdown,
 }
 
@@ -560,10 +564,14 @@ fn engine_loop(
                 EngineCommand::SaveClip => {
                     handle_save_clip(&mut session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
-                EngineCommand::UpdateConfig(new_cfg) => {
+                EngineCommand::UpdateConfig {
+                    config: new_cfg,
+                    persist_to_disk,
+                } => {
                     apply_config_update(
                         &mut cfg,
                         new_cfg,
+                        persist_to_disk,
                         &mut session,
                         &mut last_game_poll,
                         &shared_status,
@@ -611,10 +619,14 @@ fn engine_loop(
                     record_and_publish_event(&session, &cfg, &telemetry, msg, true);
                     let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
                 }
-                EngineCommand::UpdateConfig(new_cfg) => {
+                EngineCommand::UpdateConfig {
+                    config: new_cfg,
+                    persist_to_disk,
+                } => {
                     apply_config_update(
                         &mut cfg,
                         new_cfg,
+                        persist_to_disk,
                         &mut session,
                         &mut last_game_poll,
                         &shared_status,
@@ -637,9 +649,11 @@ fn engine_loop(
     info!("Motor de Bals apagado limpiamente");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_config_update(
     cfg: &mut AppConfig,
     new_cfg: AppConfig,
+    persist_to_disk: bool,
     session: &mut Option<ActiveSession>,
     last_game_poll: &mut Instant,
     shared_status: &Arc<Mutex<EngineStatus>>,
@@ -664,8 +678,10 @@ fn apply_config_update(
 
     let prev_state = session.as_ref().map(|s| s.state.clone());
     *cfg = new_cfg;
-    if let Err(err) = cfg.save() {
-        warn!("Error guardando config.toml: {err:#}");
+    if persist_to_disk {
+        if let Err(err) = cfg.save() {
+            warn!("Error guardando config.toml: {err:#}");
+        }
     }
 
     if mode_changed {

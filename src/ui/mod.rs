@@ -290,8 +290,8 @@ impl BalsUiApp {
                     self.set_banner("CONFIG GUARDADA Y APLICADA EN VIVO.", false);
                 } else {
                     self.set_banner(
-                        "Config guardada en config.toml (inicia Bals en bandeja).",
-                        false,
+                        "Config guardada, pero Bals no está activo en la bandeja.",
+                        true,
                     );
                 }
             }
@@ -385,9 +385,19 @@ impl BalsUiApp {
             *st = UpdateUiState::Downloading;
         }
         std::thread::spawn(move || {
+            // Descargar y verificar integridad del ejecutable ANTES de detener el daemon.
+            let bytes = match updater::download_update_bytes(&info) {
+                Ok(b) => b,
+                Err(err) => {
+                    if let Ok(mut st) = state_arc.lock() {
+                        *st = UpdateUiState::Error(format!("{err:#}"));
+                    }
+                    return;
+                }
+            };
             ipc::notify_shutdown();
-            std::thread::sleep(Duration::from_millis(250));
-            match updater::download_and_apply_update(&info, &[]) {
+            std::thread::sleep(Duration::from_millis(300));
+            match updater::apply_downloaded_update(&bytes, &info, &[]) {
                 Ok(()) => std::process::exit(0),
                 Err(err) => {
                     if let Ok(mut st) = state_arc.lock() {
@@ -571,7 +581,19 @@ impl BalsUiApp {
         // Atajos de consola cuando ningún cuadro de texto tiene foco.
         let text_editing = ctx.egui_wants_keyboard_input();
         let (switch_settings, switch_clips, save_now, toggle_rec) = ctx.input(|i| {
-            let ctrl_s = i.modifiers.ctrl && i.key_pressed(egui::Key::S);
+            // Evitar disparos repetidos al mantener presionado Ctrl+S (`repeat == false`).
+            let ctrl_s = i.events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    egui::Event::Key {
+                        key: egui::Key::S,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl && !modifiers.alt && !modifiers.shift
+                )
+            });
             let f1 = i.key_pressed(egui::Key::F1);
             let f2 = i.key_pressed(egui::Key::F2);
             let f5 = i.key_pressed(egui::Key::F5);
