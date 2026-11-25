@@ -20,6 +20,7 @@ pub struct SharedD3DDevice {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
     pub winrt_device: IDirect3DDevice,
+    pub adapter_name: String,
     #[allow(dead_code)]
     pub has_video_support: bool,
 }
@@ -71,6 +72,7 @@ impl SharedD3DDevice {
             device,
             context,
             winrt_device,
+            adapter_name: adapter_desc,
             has_video_support,
         })
     }

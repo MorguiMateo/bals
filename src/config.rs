@@ -111,7 +111,40 @@ impl fmt::Display for QualityPreset {
     }
 }
 
-/// Preferencia de encoder de video H.264.
+/// Codec de video utilizado para grabar los clips en el Replay Buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VideoCodec {
+    /// H.264 (AVC): máxima compatibilidad universal (Discord, WhatsApp, navegadores).
+    #[default]
+    H264,
+    /// H.265 (HEVC): ~32% menos peso y RAM con la misma nitidez visual (GPU moderna).
+    Hevc,
+}
+
+impl VideoCodec {
+    pub const fn label(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Hevc => "H.265 (HEVC)",
+        }
+    }
+
+    /// Factor de bitrate relativo respecto a H.264 para mantener igual o mayor nitidez.
+    pub const fn bitrate_scale_pct(self) -> u32 {
+        match self {
+            VideoCodec::H264 => 100,
+            VideoCodec::Hevc => 68,
+        }
+    }
+}
+
+impl fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
+/// Preferencia de encoder de video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EncoderPreference {
     /// Automático: prioriza GPU por hardware (AMD AMF / NVIDIA NVENC / Intel QSV), con fallback a CPU.
@@ -139,11 +172,13 @@ impl fmt::Display for EncoderPreference {
     }
 }
 
-/// Configuración de video del encoder H.264.
+/// Configuración de video del encoder H.264 / HEVC.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoConfig {
     pub resolution: Resolution,
     pub fps: FrameRate,
+    pub quality: QualityPreset,
+    pub codec: VideoCodec,
     /// Bitrate promedio objetivo en bits por segundo.
     pub bitrate_bps: u32,
     /// Intervalo de keyframes (IDR) en segundos (2 s es ideal para replay buffer).
@@ -153,35 +188,46 @@ pub struct VideoConfig {
 }
 
 impl VideoConfig {
+    #[allow(dead_code)]
     pub const fn preset(resolution: Resolution, fps: FrameRate) -> Self {
         Self::preset_with_quality(resolution, fps, QualityPreset::Balanced)
     }
 
+    #[allow(dead_code)]
     pub const fn preset_with_quality(
         resolution: Resolution,
         fps: FrameRate,
         quality: QualityPreset,
     ) -> Self {
-        Self::preset_full(resolution, fps, quality, EncoderPreference::AutoGpu)
+        Self::preset_full(
+            resolution,
+            fps,
+            quality,
+            VideoCodec::H264,
+            EncoderPreference::AutoGpu,
+        )
     }
 
     pub const fn preset_full(
         resolution: Resolution,
         fps: FrameRate,
         quality: QualityPreset,
+        codec: VideoCodec,
         encoder_pref: EncoderPreference,
     ) -> Self {
-        let bitrate_bps = Self::recommended_bitrate_for(resolution, fps, quality);
+        let bitrate_bps = Self::recommended_bitrate_for_codec(resolution, fps, quality, codec);
         Self {
             resolution,
             fps,
+            quality,
+            codec,
             bitrate_bps,
             gop_secs: 2,
             encoder_pref,
         }
     }
 
-    /// Bitrate equilibrado para clips de juegos (buena calidad visual con bajo consumo de RAM/disco).
+    /// Bitrate equilibrado para clips de juegos en H.264.
     pub const fn recommended_bitrate(resolution: Resolution, fps: FrameRate) -> u32 {
         match (resolution, fps) {
             (Resolution::P720, FrameRate::Fps30) => 4_000_000,   // 4 Mbps  (~15 MB / 30s)
@@ -193,13 +239,33 @@ impl VideoConfig {
         }
     }
 
+    #[allow(dead_code)]
     pub const fn recommended_bitrate_for(
         resolution: Resolution,
         fps: FrameRate,
         quality: QualityPreset,
     ) -> u32 {
+        Self::recommended_bitrate_for_codec(resolution, fps, quality, VideoCodec::H264)
+    }
+
+    pub const fn recommended_bitrate_for_codec(
+        resolution: Resolution,
+        fps: FrameRate,
+        quality: QualityPreset,
+        codec: VideoCodec,
+    ) -> u32 {
         let base = Self::recommended_bitrate(resolution, fps) as u64;
-        ((base * quality.bitrate_scale_pct() as u64) / 100) as u32
+        let scaled = (base * quality.bitrate_scale_pct() as u64) / 100;
+        ((scaled * codec.bitrate_scale_pct() as u64) / 100) as u32
+    }
+
+    /// Calidad objetivo QVBR (escala 0..=100 de `CODECAPI_AVEncCommonQuality`).
+    pub const fn qvbr_quality_level(&self) -> u32 {
+        match self.quality {
+            QualityPreset::Compact => 62,
+            QualityPreset::Balanced => 74,
+            QualityPreset::High => 84,
+        }
     }
 
     pub const fn gop_frames(&self) -> u32 {
@@ -341,6 +407,7 @@ pub struct AppConfig {
     pub resolution: Resolution,
     pub fps: FrameRate,
     pub quality: QualityPreset,
+    pub video_codec: VideoCodec,
     pub encoder_pref: EncoderPreference,
     pub replay_duration: ReplayDuration,
     /// Atajo global para guardar los últimos N segundos (por defecto `\`).
@@ -371,6 +438,7 @@ impl Default for AppConfig {
             resolution: Resolution::P1080,
             fps: FrameRate::Fps60,
             quality: QualityPreset::Balanced,
+            video_codec: VideoCodec::H264,
             encoder_pref: EncoderPreference::AutoGpu,
             replay_duration: ReplayDuration::Sec30,
             save_clip_hotkey: "\\".to_string(),
@@ -393,7 +461,13 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn video_config(&self) -> VideoConfig {
-        VideoConfig::preset_full(self.resolution, self.fps, self.quality, self.encoder_pref)
+        VideoConfig::preset_full(
+            self.resolution,
+            self.fps,
+            self.quality,
+            self.video_codec,
+            self.encoder_pref,
+        )
     }
 
     pub fn audio_config(&self, source: AudioSource) -> AudioConfig {

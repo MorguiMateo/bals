@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::audio::{AudioStreamInfo, EncodedAudioPacket};
-use crate::encode::{EncodedVideoPacket, extract_sps_pps_annexb};
+use crate::config::VideoCodec;
+use crate::encode::{EncodedVideoPacket, extract_codec_headers_annexb};
 
 /// Instantánea inmutable y **Zero-Copy** (`Arc<[u8]>`) de los últimos N segundos de video H.264
 /// + audio AAC comprimidos, lista para muxing MP4 en un hilo secundario sin bloquear la grabación
@@ -46,6 +47,8 @@ impl ClipSnapshot {
 pub struct ReplayBuffer {
     video_packets: VecDeque<EncodedVideoPacket>,
     audio_packets: VecDeque<EncodedAudioPacket>,
+    /// Codec activo del flujo de video (H.264 o HEVC) para extraer cabeceras SPS/PPS o VPS/SPS/PPS.
+    codec: VideoCodec,
     /// Secuencia monotónica del primer paquete en `video_packets` (`video_packets[0]`).
     base_seq: u64,
     /// Posiciones (en coordenadas de secuencia) de todos los Keyframes presentes en `video_packets`.
@@ -58,11 +61,18 @@ pub struct ReplayBuffer {
 }
 
 impl ReplayBuffer {
-    /// Crea un nuevo buffer circular con duración objetivo y límite máximo de RAM en bytes.
+    /// Crea un nuevo buffer circular H.264 con duración objetivo y límite máximo de RAM en bytes.
+    #[allow(dead_code)]
     pub fn new(duration_secs: u32, max_bytes: usize) -> Self {
+        Self::new_for_codec(duration_secs, max_bytes, VideoCodec::H264)
+    }
+
+    /// Crea un nuevo buffer circular para el codec especificado (`H264` o `Hevc`).
+    pub fn new_for_codec(duration_secs: u32, max_bytes: usize, codec: VideoCodec) -> Self {
         Self {
             video_packets: VecDeque::with_capacity(duration_secs as usize * 65),
             audio_packets: VecDeque::with_capacity(duration_secs as usize * 50),
+            codec,
             base_seq: 0,
             keyframe_seqs: VecDeque::with_capacity(duration_secs as usize / 2 + 4),
             sps_pps_annexb: None,
@@ -78,10 +88,10 @@ impl ReplayBuffer {
         self.audio_info = Some(info);
     }
 
-    /// Inserta un paquete H.264 en el buffer circular y purga GOPs antiguos en O(1) si excede tiempo o RAM.
+    /// Inserta un paquete H.264/HEVC en el buffer circular y purga GOPs antiguos en O(1) si excede tiempo o RAM.
     pub fn push_video(&mut self, packet: EncodedVideoPacket) {
         if packet.is_keyframe {
-            if let Some(headers) = extract_sps_pps_annexb(&packet.data) {
+            if let Some(headers) = extract_codec_headers_annexb(&packet.data, self.codec) {
                 self.sps_pps_annexb = Some(headers);
             }
         }

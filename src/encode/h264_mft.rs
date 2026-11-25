@@ -5,56 +5,63 @@ use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
     CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator,
-    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput,
-    METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MFTEnumEx,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
-    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_High,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
+    IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator, IMFSample, IMFTransform,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown,
+    MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFT_REGISTER_TYPE_INFO, MFMediaType_Video, MFSampleExtension_CleanPoint, MFVideoFormat_H264,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_High, eAVEncH265VProfile_Main_420_8,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{IUnknown, Interface};
+use windows::core::{GUID, IUnknown, Interface};
 
-use crate::config::{EncoderPreference, VideoConfig};
+use crate::config::{EncoderPreference, VideoCodec, VideoConfig};
 use crate::d3d::SharedD3DDevice;
-use crate::encode::{EncodedVideoPacket, annexb_contains_idr};
+use crate::encode::{EncodedVideoPacket, annexb_contains_idr_for};
 
-/// Resumen de encoders H.264 disponibles en el sistema (para mostrar en el selector de la UI).
+/// Resumen de encoders de video (H.264 + H.265/HEVC) disponibles en el sistema.
 #[derive(Debug, Clone, Default)]
 pub struct DetectedEncoders {
     pub hw_name: Option<String>,
     pub hw_short: Option<String>,
     pub sw_name: Option<String>,
+    pub hevc_hw_name: Option<String>,
+    pub hevc_hw_available: bool,
 }
 
-/// Enumera los encoders H.264 (Hardware GPU y Software CPU) instalados en Windows Media Foundation.
+/// Enumera los encoders de video H.264 y HEVC (Hardware GPU y Software CPU) en Media Foundation.
 pub fn detect_system_encoders() -> DetectedEncoders {
     let mut out = DetectedEncoders::default();
     if unsafe { MFStartup(MF_VERSION, 0) }.is_err() {
         return out;
     }
 
-    if let Some(hw) = first_enumerated_encoder_name(true) {
+    if let Some(hw) = first_enumerated_encoder_name(VideoCodec::H264, true) {
         out.hw_short = Some(short_hw_label(&hw));
         out.hw_name = Some(hw);
     }
-    out.sw_name = first_enumerated_encoder_name(false);
+    out.sw_name = first_enumerated_encoder_name(VideoCodec::H264, false);
+
+    if let Some(hevc_hw) = first_enumerated_encoder_name(VideoCodec::Hevc, true) {
+        out.hevc_hw_available = true;
+        out.hevc_hw_name = Some(hevc_hw);
+    }
 
     unsafe {
         let _ = MFShutdown();
@@ -75,13 +82,33 @@ fn short_hw_label(name: &str) -> String {
     }
 }
 
-fn first_enumerated_encoder_name(hardware: bool) -> Option<String> {
+fn vendor_token(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("nvidia") || lower.contains("nvenc") || lower.contains("geforce") || lower.contains("rtx") || lower.contains("gtx") {
+        Some("nvidia")
+    } else if lower.contains("amd") || lower.contains("radeon") || lower.contains("amf") || lower.contains("vce") {
+        Some("amd")
+    } else if lower.contains("intel") || lower.contains("qsv") || lower.contains("arc") || lower.contains("uhd") || lower.contains("iris") {
+        Some("intel")
+    } else {
+        None
+    }
+}
+
+fn codec_subtype(codec: VideoCodec) -> GUID {
+    match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
+        VideoCodec::Hevc => MFVideoFormat_HEVC,
+    }
+}
+
+fn first_enumerated_encoder_name(codec: VideoCodec, hardware: bool) -> Option<String> {
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: codec_subtype(codec),
     };
     let flags = if hardware {
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
     } else {
         MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER
     };
@@ -120,8 +147,9 @@ fn first_enumerated_encoder_name(hardware: bool) -> Option<String> {
     found
 }
 
-/// Encoder H.264 por Hardware vía Windows Media Foundation (NVENC / AMD AMF / Intel QSV),
-/// con soporte Zero-Copy sobre texturas D3D11 `NV12` y fallback automático a MFT software.
+/// Encoder de video (H.264 o HEVC/H.265) por Hardware vía Windows Media Foundation
+/// (NVIDIA NVENC / AMD AMF / Intel QSV), con emparejamiento de adaptador D3D11 para GPUs
+/// híbridas, Zero-Copy sobre texturas D3D11 `NV12` y fallback automático a software.
 pub struct H264Encoder {
     mft: IMFTransform,
     codec_api: Option<ICodecAPI>,
@@ -129,6 +157,7 @@ pub struct H264Encoder {
     _dxgi_manager: Option<IMFDXGIDeviceManager>,
     #[allow(dead_code)]
     pub name: String,
+    pub active_codec: VideoCodec,
     #[allow(dead_code)]
     pub is_hardware: bool,
     pub is_async: bool,
@@ -146,7 +175,7 @@ impl H264Encoder {
     pub fn new(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
         unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup falló")?;
 
-        match Self::init_inner(d3d, config) {
+        match Self::init_with_fallbacks(d3d, config) {
             Ok(enc) => Ok(enc),
             Err(err) => {
                 unsafe {
@@ -157,39 +186,98 @@ impl H264Encoder {
         }
     }
 
-    fn init_inner(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
-        // 1. Elegir encoder H.264 según la preferencia del usuario (Auto GPU, Solo GPU o CPU Software).
-        let (mft, name, is_hardware) = match config.encoder_pref {
-            EncoderPreference::AutoGpu => match activate_h264_mft(true) {
-                Ok((mft, name)) => (mft, name, true),
-                Err(hw_err) => {
-                    warn!("No se pudo activar encoder H.264 por hardware ({hw_err:#}); usando fallback software");
-                    let (mft, name) = activate_h264_mft(false)
-                        .context("No se encontró ningún encoder H.264 en Media Foundation")?;
-                    (mft, name, false)
-                }
-            },
-            EncoderPreference::HardwareGpu => {
-                let (mft, name) = activate_h264_mft(true)
-                    .context("No se pudo activar el encoder H.264 por hardware de tu GPU")?;
-                (mft, name, true)
+    /// Intenta activar el codec y backend elegidos; si HEVC hardware no está disponible
+    /// en el equipo (o el usuario eligió CPU Software con HEVC), cae limpiamente a H.264.
+    fn init_with_fallbacks(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
+        let mut attempts: Vec<(VideoCodec, bool)> = Vec::new();
+        match (config.codec, config.encoder_pref) {
+            (VideoCodec::Hevc, EncoderPreference::HardwareGpu) => {
+                attempts.push((VideoCodec::Hevc, true));
+                attempts.push((VideoCodec::H264, true));
             }
-            EncoderPreference::SoftwareCpu => {
-                let (mft, name) = activate_h264_mft(false)
-                    .context("No se encontró el encoder H.264 por software (CPU)")?;
-                (mft, name, false)
+            (VideoCodec::Hevc, EncoderPreference::AutoGpu) => {
+                attempts.push((VideoCodec::Hevc, true));
+                attempts.push((VideoCodec::H264, true));
+                attempts.push((VideoCodec::H264, false));
             }
-        };
+            (VideoCodec::Hevc, EncoderPreference::SoftwareCpu) => {
+                // Media Foundation no incluye encoder HEVC por CPU de serie; usar H.264 SW.
+                attempts.push((VideoCodec::H264, false));
+            }
+            (VideoCodec::H264, EncoderPreference::HardwareGpu) => {
+                attempts.push((VideoCodec::H264, true));
+            }
+            (VideoCodec::H264, EncoderPreference::AutoGpu) => {
+                attempts.push((VideoCodec::H264, true));
+                attempts.push((VideoCodec::H264, false));
+            }
+            (VideoCodec::H264, EncoderPreference::SoftwareCpu) => {
+                attempts.push((VideoCodec::H264, false));
+            }
+        }
 
-        // 2. Comprobar si es un MFT asíncrono (prácticamente todos los HW MFT lo son) y desbloquearlo.
+        let mut last_err = None;
+        for (codec, hardware) in attempts {
+            let mut effective_cfg = config;
+            effective_cfg.codec = codec;
+            effective_cfg.bitrate_bps = VideoConfig::recommended_bitrate_for_codec(
+                config.resolution,
+                config.fps,
+                config.quality,
+                codec,
+            );
+            match Self::init_inner(d3d, effective_cfg, hardware) {
+                Ok(enc) => return Ok(enc),
+                Err(err) => {
+                    warn!(
+                        codec = %codec,
+                        hardware,
+                        "No se pudo iniciar encoder ({err:#}); probando siguiente opción"
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No se encontró ningún encoder de video")))
+    }
+
+    fn init_inner(d3d: &SharedD3DDevice, config: VideoConfig, hardware: bool) -> Result<Self> {
+        let preferred_vendor = vendor_token(&d3d.adapter_name);
+        let candidates = enumerate_mft_candidates(config.codec, hardware, preferred_vendor)?;
+
+        let mut last_err = None;
+        for (activate, name) in candidates {
+            match Self::try_activate_candidate(d3d, config, hardware, activate, name) {
+                Ok(enc) => return Ok(enc),
+                Err(err) => {
+                    debug!("Candidato MFT descartado: {err:#}");
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Ningún MFT candidato pudo inicializarse")))
+    }
+
+    fn try_activate_candidate(
+        d3d: &SharedD3DDevice,
+        config: VideoConfig,
+        is_hardware: bool,
+        activate: IMFActivate,
+        name: String,
+    ) -> Result<Self> {
+        let mft: IMFTransform = unsafe { activate.ActivateObject() }
+            .with_context(|| format!("ActivateObject falló para {name}"))?;
+
         let attrs = unsafe { mft.GetAttributes() }.context("GetAttributes en MFT falló")?;
         let is_async = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
         if is_async {
             unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }
-                .context("No se pudo desbloquear el MFT asíncrono (MF_TRANSFORM_ASYNC_UNLOCK)")?;
+                .context("No se pudo desbloquear el MFT asíncrono")?;
         }
 
-        // 3. Si soporta D3D11 (Zero-Copy), vincular el mismo ID3D11Device mediante IMFDXGIDeviceManager.
+        // Vincular ID3D11Device compartido vía IMFDXGIDeviceManager para Zero-Copy en VRAM.
         let d3d11_aware = unsafe { attrs.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or(0) != 0;
         let mut dxgi_manager = None;
         if is_hardware || d3d11_aware {
@@ -205,27 +293,31 @@ impl H264Encoder {
             unsafe {
                 mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr_unk.as_raw() as usize)
             }
-            .context("MFT_MESSAGE_SET_D3D_MANAGER falló")?;
+            .with_context(|| format!("MFT_MESSAGE_SET_D3D_MANAGER falló en {name}"))?;
             dxgi_manager = Some(mgr);
         }
 
-        // 4. Configurar tipos de salida (H.264) y entrada (NV12).
+        // Configurar tipo de salida (H.264 o HEVC) y entrada (NV12).
         let (width, height) = config.resolution.dimensions();
         let fps = config.fps.as_u32();
 
         let output_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (out) falló")?;
         unsafe {
             output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            output_type.SetGUID(&MF_MT_SUBTYPE, &codec_subtype(config.codec))?;
             output_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_bps)?;
             output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
             output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
             output_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
-            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+            let profile = match config.codec {
+                VideoCodec::H264 => eAVEncH264VProfile_High.0 as u32,
+                VideoCodec::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
+            };
+            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
             mft.SetOutputType(0, &output_type, 0)
         }
-        .context("IMFTransform::SetOutputType (H.264) falló")?;
+        .with_context(|| format!("SetOutputType ({}) falló en {name}", config.codec))?;
 
         let input_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (in) falló")?;
         unsafe {
@@ -237,12 +329,11 @@ impl H264Encoder {
             input_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
             mft.SetInputType(0, &input_type, 0)
         }
-        .context("IMFTransform::SetInputType (NV12) falló")?;
+        .with_context(|| format!("SetInputType (NV12) falló en {name}"))?;
 
-        // 5. Configurar parámetros finos vía ICodecAPI (GOP, baja latencia, 0 B-frames, bitrate).
+        // Configurar parámetros óptimos de calidad local (sin LowLatencyMode + QVBR/VBR con techo).
         configure_codec_api(&mft, config);
 
-        // 6. Consultar si el MFT asigna sus propios samples de salida.
         let out_info = unsafe { mft.GetOutputStreamInfo(0) }
             .context("GetOutputStreamInfo falló")?;
         let mft_provides_output_samples = (out_info.dwFlags
@@ -260,7 +351,6 @@ impl H264Encoder {
             None
         };
 
-        // 7. Arrancar streaming del MFT.
         unsafe {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -268,6 +358,8 @@ impl H264Encoder {
 
         info!(
             encoder = %name,
+            codec = %config.codec,
+            adapter = %d3d.adapter_name,
             hardware = is_hardware,
             async_mft = is_async,
             zero_copy = dxgi_manager.is_some(),
@@ -275,7 +367,7 @@ impl H264Encoder {
             fps = %config.fps,
             bitrate_mbps = format!("{:.1}", config.bitrate_bps as f64 / 1_000_000.0),
             gop_frames = config.gop_frames(),
-            "Encoder H.264 Media Foundation iniciado"
+            "Encoder de video Media Foundation iniciado"
         );
 
         let codec_api = mft.cast::<ICodecAPI>().ok();
@@ -286,6 +378,7 @@ impl H264Encoder {
             event_gen,
             _dxgi_manager: dxgi_manager,
             name,
+            active_codec: config.codec,
             is_hardware,
             is_async,
             mft_provides_output_samples,
@@ -299,21 +392,16 @@ impl H264Encoder {
         })
     }
 
-    /// Etiqueta corta del encoder activo para mostrar en el HUD de la consola retro.
+    /// Etiqueta corta del encoder y codec activos para mostrar en el HUD de la consola retro.
     pub fn hardware_label(&self) -> String {
+        let codec_tag = match self.active_codec {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Hevc => "H.265",
+        };
         if !self.is_hardware {
-            return "CPU SW".to_string();
+            return format!("CPU SW · {codec_tag}");
         }
-        let lower = self.name.to_ascii_lowercase();
-        if lower.contains("nvidia") || lower.contains("nvenc") {
-            "NVENC HW".to_string()
-        } else if lower.contains("amd") || lower.contains("amf") || lower.contains("vce") {
-            "AMD AMF HW".to_string()
-        } else if lower.contains("intel") || lower.contains("qsv") {
-            "INTEL QSV HW".to_string()
-        } else {
-            "GPU HW".to_string()
-        }
+        format!("{} · {codec_tag}", short_hw_label(&self.name))
     }
 
     /// Solicita explícitamente un Keyframe (IDR) al encoder para el próximo frame.
@@ -326,17 +414,13 @@ impl H264Encoder {
         }
     }
 
-    /// Envía una textura `ID3D11Texture2D` (`NV12`) en VRAM al encoder (Zero-Copy)
-    /// usando `rel_pts_100ns` comenzando desde `0` (óptimo para el rate-control de AMD/NVIDIA/Intel),
-    /// y devuelve los paquetes H.264 remapeados al reloj QPC absoluto (`qpc_origin_100ns + rel_pts`)
-    /// para sincronizar exactamente con el audio en el `ReplayBuffer`.
+    /// Envía una textura `ID3D11Texture2D` (`NV12`) en VRAM al encoder (Zero-Copy).
     pub fn encode_nv12_texture(
         &mut self,
         nv12_texture: &ID3D11Texture2D,
         rel_pts_100ns: i64,
         qpc_origin_100ns: i64,
     ) -> Result<Vec<EncodedVideoPacket>> {
-        // Garantizar un Keyframe (IDR) exacto cada `gop_secs` segundos.
         match self.last_forced_kf_ts {
             None => {
                 self.force_keyframe();
@@ -392,7 +476,11 @@ impl H264Encoder {
 
         if let Some(event_gen) = self.event_gen.clone() {
             loop {
-                let event = match unsafe { event_gen.GetEvent(windows::Win32::Media::MediaFoundation::MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)) } {
+                let event = match unsafe {
+                    event_gen.GetEvent(
+                        windows::Win32::Media::MediaFoundation::MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0),
+                    )
+                } {
                     Ok(ev) => ev,
                     Err(_) => break,
                 };
@@ -480,7 +568,6 @@ impl H264Encoder {
 
         let hr = unsafe { self.mft.ProcessOutput(0, &mut output_buffers, &mut status) };
 
-        // Extraer los Option fuera de ManuallyDrop para asegurar que se liberen siempre.
         let out_sample = unsafe { ManuallyDrop::take(&mut output_buffers[0].pSample) };
         let _out_events = unsafe { ManuallyDrop::take(&mut output_buffers[0].pEvents) };
 
@@ -540,7 +627,7 @@ impl H264Encoder {
             return Ok(None);
         }
 
-        let is_keyframe = clean_point || annexb_contains_idr(&data);
+        let is_keyframe = clean_point || annexb_contains_idr_for(&data, self.active_codec);
 
         Ok(Some(EncodedVideoPacket {
             data,
@@ -561,16 +648,22 @@ impl Drop for H264Encoder {
     }
 }
 
-fn activate_h264_mft(hardware: bool) -> Result<(IMFTransform, String)> {
+/// Enumera candidatos MFT priorizando el fabricante del adaptador D3D11 activo
+/// (crítico en laptops/PCs híbridas Intel + NVIDIA para enlazar NVENC con la GPU NVIDIA).
+fn enumerate_mft_candidates(
+    codec: VideoCodec,
+    hardware: bool,
+    preferred_vendor: Option<&'static str>,
+) -> Result<Vec<(IMFActivate, String)>> {
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: codec_subtype(codec),
     };
 
     let flags = if hardware {
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
     } else {
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER
     };
 
     let mut raw_activates: *mut Option<IMFActivate> = std::ptr::null_mut();
@@ -589,25 +682,15 @@ fn activate_h264_mft(hardware: bool) -> Result<(IMFTransform, String)> {
     .context("MFTEnumEx falló")?;
 
     if count == 0 || raw_activates.is_null() {
-        bail!("MFTEnumEx devolvió 0 encoders H.264 (hardware={hardware})");
+        bail!("MFTEnumEx devolvió 0 encoders {} (hardware={hardware})", codec);
     }
 
-    let mut chosen: Option<(IMFTransform, String)> = None;
+    let mut list: Vec<(IMFActivate, String)> = Vec::with_capacity(count as usize);
     let slice = unsafe { std::slice::from_raw_parts_mut(raw_activates, count as usize) };
-
     for slot in slice.iter_mut() {
         if let Some(activate) = slot.take() {
-            let friendly = get_friendly_name(&activate).unwrap_or_else(|| "H264 MFT".to_string());
-            if chosen.is_none() {
-                match unsafe { activate.ActivateObject::<IMFTransform>() } {
-                    Ok(mft) => {
-                        chosen = Some((mft, friendly));
-                    }
-                    Err(err) => {
-                        warn!(encoder = %friendly, "No se pudo activar MFT: {err}");
-                    }
-                }
-            }
+            let friendly = get_friendly_name(&activate).unwrap_or_else(|| format!("{codec} MFT"));
+            list.push((activate, friendly));
         }
     }
 
@@ -615,7 +698,14 @@ fn activate_h264_mft(hardware: bool) -> Result<(IMFTransform, String)> {
         CoTaskMemFree(Some(raw_activates as *const _));
     }
 
-    chosen.context("Ninguno de los MFT enumerados pudo activarse")
+    // Priorizar el MFT que coincide con el fabricante del adaptador D3D11 (NVIDIA / AMD / Intel).
+    if hardware {
+        if let Some(want) = preferred_vendor {
+            list.sort_by_key(|(_, name)| usize::from(vendor_token(name) != Some(want)));
+        }
+    }
+
+    Ok(list)
 }
 
 fn get_friendly_name(activate: &IMFActivate) -> Option<String> {
@@ -629,49 +719,66 @@ fn get_friendly_name(activate: &IMFActivate) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
+/// Configura parámetros óptimos de calidad local (0% CPU/GPU extra):
+/// - `AVLowLatencyMode = false`: permite al chip ASIC (NVENC/AMF/QSV) usar estimación de movimiento
+///   completa (~15–20% más nitidez al mismo bitrate).
+/// - `QualityVsSpeed = 70`: mayor calidad visual usando el ASIC dedicado sin afectar shaders 3D.
+/// - **QVBR** (`Quality` + `CommonQuality` + techo `MaxBitRate`), con fallback a `PeakConstrainedVBR` / `CBR`.
 fn configure_codec_api(mft: &IMFTransform, config: VideoConfig) {
     let Ok(codec_api) = mft.cast::<ICodecAPI>() else {
         debug!("El MFT no expone ICodecAPI; se usarán sus valores por defecto");
         return;
     };
 
-    let set_u32 = |guid: &windows::core::GUID, val: u32, label: &str| {
+    let set_u32 = |guid: &GUID, val: u32, label: &str| {
         let var = VARIANT::from(val);
         if let Err(err) = unsafe { codec_api.SetValue(guid, &var) } {
             debug!("ICodecAPI {label} no soportado por este driver: {err}");
         }
     };
 
-    let set_bool = |guid: &windows::core::GUID, val: bool, label: &str| {
+    let set_bool = |guid: &GUID, val: bool, label: &str| {
         let var = VARIANT::from(val);
         if let Err(err) = unsafe { codec_api.SetValue(guid, &var) } {
             debug!("ICodecAPI {label} no soportado por este driver: {err}");
         }
     };
 
-    // 1. Activar baja latencia y 0 B-frames PRIMERO (en AMD AMF cambiar LowLatencyMode
-    //    después del bitrate puede resetear el rate-control interno del driver).
-    set_bool(&CODECAPI_AVLowLatencyMode, true, "LowLatencyMode=true");
+    // 1. Modo grabación local (no streaming de ultra-baja latencia) para máxima nitidez por MB.
+    set_bool(&CODECAPI_AVLowLatencyMode, false, "LowLatencyMode=false");
     set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");
     set_u32(&CODECAPI_AVEncMPVGOPSize, config.gop_frames(), "GOPSize");
-    set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 50, "QualityVsSpeed=50");
+    set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 70, "QualityVsSpeed=70");
 
-    // 2. Configurar rate-control con techo estricto (PeakConstrainedVBR + fallback CBR).
-    let max_bitrate = config.bitrate_bps.saturating_mul(125) / 100;
-    let vbr_mode = VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
-    if unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &vbr_mode) }.is_err() {
-        set_u32(
-            &CODECAPI_AVEncCommonRateControlMode,
-            eAVEncCommonRateControlMode_CBR.0 as u32,
-            "RateControlMode=CBR",
+    // 2. Rate-control QVBR (Calidad constante con techo MaxBitRate) -> clips livianos en escenas
+    //    quietas y nítidos en acción rápida sin disparar el consumo de RAM del Replay Buffer.
+    let max_bitrate = config.bitrate_bps.saturating_mul(135) / 100;
+    let quality_var = VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32);
+    let q_val = VARIANT::from(config.qvbr_quality_level());
+
+    let qvbr_ok = unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &quality_var) }.is_ok()
+        && unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonQuality, &q_val) }.is_ok();
+
+    if qvbr_ok {
+        set_u32(&CODECAPI_AVEncCommonMeanBitRate, config.bitrate_bps, "MeanBitRate");
+        set_u32(&CODECAPI_AVEncCommonMaxBitRate, max_bitrate, "MaxBitRate(QVBR)");
+        debug!(
+            qvbr_quality = config.qvbr_quality_level(),
+            max_mbps = format!("{:.1}", max_bitrate as f64 / 1_000_000.0),
+            "Rate-control QVBR activado"
         );
+    } else {
+        let vbr_mode = VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
+        if unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &vbr_mode) }.is_err() {
+            set_u32(
+                &CODECAPI_AVEncCommonRateControlMode,
+                eAVEncCommonRateControlMode_CBR.0 as u32,
+                "RateControlMode=CBR",
+            );
+        }
+        set_u32(&CODECAPI_AVEncCommonMeanBitRate, config.bitrate_bps, "MeanBitRate");
+        set_u32(&CODECAPI_AVEncCommonMaxBitRate, max_bitrate, "MaxBitRate");
     }
-    set_u32(
-        &CODECAPI_AVEncCommonMeanBitRate,
-        config.bitrate_bps,
-        "MeanBitRate",
-    );
-    set_u32(&CODECAPI_AVEncCommonMaxBitRate, max_bitrate, "MaxBitRate");
 }
 
 fn create_sample_from_texture(
@@ -680,15 +787,8 @@ fn create_sample_from_texture(
     duration_100ns: i64,
 ) -> Result<IMFSample> {
     let sample = unsafe { MFCreateSample() }.context("MFCreateSample falló")?;
-    let buffer = unsafe {
-        MFCreateDXGISurfaceBuffer(
-            &ID3D11Texture2D::IID,
-            texture,
-            0,
-            false,
-        )
-    }
-    .context("MFCreateDXGISurfaceBuffer falló")?;
+    let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false) }
+        .context("MFCreateDXGISurfaceBuffer falló")?;
 
     unsafe {
         sample.AddBuffer(&buffer)?;

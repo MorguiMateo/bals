@@ -200,7 +200,7 @@ impl ActiveSession {
     ) -> Result<Self> {
         let timer_guard = HighResTimerGuard::new();
         let d3d = SharedD3DDevice::new()?;
-        let video_config = cfg.video_config();
+        let mut video_config = cfg.video_config();
         let capture = WgcCapture::start(&d3d, target, cfg.capture_cursor)?;
         let (out_w, out_h) = video_config.resolution.dimensions();
 
@@ -213,10 +213,12 @@ impl ActiveSession {
             video_config.fps.as_u32(),
         )?;
         let encoder = H264Encoder::new(&d3d, video_config)?;
+        video_config.codec = encoder.active_codec;
         let encoder_label = encoder.hardware_label();
 
         let max_bytes = cfg.max_buffer_ram_mb.max(32) * 1024 * 1024;
-        let mut replay_buffer = ReplayBuffer::new(cfg.replay_duration.as_secs(), max_bytes);
+        let mut replay_buffer =
+            ReplayBuffer::new_for_codec(cfg.replay_duration.as_secs(), max_bytes, encoder.active_codec);
 
         let audio = match AudioPipeline::start(cfg.audio_config(audio_source)) {
             Ok(pipe) => {
@@ -599,6 +601,7 @@ fn apply_config_update(
     let needs_restart = new_cfg.resolution != cfg.resolution
         || new_cfg.fps != cfg.fps
         || new_cfg.quality != cfg.quality
+        || new_cfg.video_codec != cfg.video_codec
         || new_cfg.encoder_pref != cfg.encoder_pref
         || new_cfg.replay_duration != cfg.replay_duration
         || new_cfg.audio_capture_mode != cfg.audio_capture_mode

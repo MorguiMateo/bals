@@ -434,21 +434,20 @@ fn render_crt_deck(
 
                 ui.add_space(5.0);
 
-                ui.horizontal(|ui| {
-                    let half = ((row_w - 7.0) / 2.0).max(120.0);
-                    if retro_pill(ui, p, false, "COMPRIMIR <10 MB (DISCORD)", vec2(half, 26.0))
-                        .on_hover_text("Recodifica en GPU para subir directo a Discord gratis")
-                        .clicked()
-                    {
-                        app.start_compress(9.5, "discord");
-                    }
-                    if retro_pill(ui, p, false, "COMPRIMIR <25 MB", vec2(half, 26.0))
-                        .on_hover_text("Recodifica en GPU manteniendo alta calidad bajo 25 MB")
-                        .clicked()
-                    {
-                        app.start_compress(24.0, "25mb");
-                    }
-                });
+                if retro_pill(
+                    ui,
+                    p,
+                    false,
+                    "COMPRIMIR CLIP (ALTA CALIDAD · MENOS PESO)",
+                    vec2(row_w, 27.0),
+                )
+                .on_hover_text(
+                    "Reduce ~45–65% el peso manteniendo hasta 1080p y 60 FPS nítidos (sin aplastar la imagen)",
+                )
+                .clicked()
+                {
+                    app.start_compress_balanced();
+                }
             });
         },
     );

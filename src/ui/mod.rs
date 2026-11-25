@@ -23,7 +23,7 @@ use crate::hotkey::parse_hotkey;
 use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
 use crate::trimmer::{
-    ClipMetadata, PreviewFrame, TrimStats, compress_mp4_to_target_mb, extract_mp4_frame_rgba,
+    ClipMetadata, PreviewFrame, TrimStats, compress_mp4_balanced, extract_mp4_frame_rgba,
     probe_mp4_metadata, suggested_output_with_suffix, suggested_trim_output, trim_mp4_passthrough,
 };
 use crate::ui::theme::{RetroPalette, apply_egui_theme};
@@ -320,11 +320,11 @@ impl BalsUiApp {
         });
     }
 
-    pub fn start_compress(&mut self, target_mb: f64, suffix: &'static str) {
+    pub fn start_compress_balanced(&mut self) {
         let Some(input_path) = self.selected_clip.clone() else {
             return;
         };
-        let output_path = suggested_output_with_suffix(&input_path, suffix);
+        let output_path = suggested_output_with_suffix(&input_path, "comp");
         let start = self.trim_start;
         let end = self.trim_end;
         let state_arc = Arc::clone(&self.trim_state);
@@ -333,15 +333,15 @@ impl BalsUiApp {
             if matches!(*st, TrimState::Running(_)) {
                 return;
             }
-            *st = TrimState::Running(format!("COMPRIMIENDO <{:.0}MB...", target_mb.ceil()));
+            *st = TrimState::Running("COMPRIMIENDO...".to_string());
         }
         self.set_banner(
-            format!("Comprimiendo clip a <{:.0} MB (espera unos segundos)...", target_mb.ceil()),
+            "Comprimiendo clip en alta calidad (1080p/60fps)...",
             false,
         );
 
         std::thread::spawn(move || {
-            let res = compress_mp4_to_target_mb(&input_path, &output_path, target_mb, start, end);
+            let res = compress_mp4_balanced(&input_path, &output_path, start, end);
             if let Ok(mut st) = state_arc.lock() {
                 *st = match res {
                     Ok(stats) => TrimState::Done(stats, true),

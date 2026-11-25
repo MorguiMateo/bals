@@ -331,10 +331,142 @@ pub fn trim_mp4_passthrough(
     })
 }
 
+/// Comprime un clip `.mp4` de forma **equilibrada y mucho menos agresiva**:
+/// mantiene hasta **1080p y 60 FPS** con audio AAC 128 kbps y alta nitidez visual,
+/// reduciendo típicamente el peso en ~45–70% sin pixelar la imagen.
+pub fn compress_mp4_balanced(
+    input_path: &Path,
+    output_path: &Path,
+    start_secs: f64,
+    end_secs: f64,
+) -> Result<TrimStats> {
+    if end_secs <= start_secs + 0.2 {
+        bail!("El rango a comprimir debe durar al menos 0.2 segundos");
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let input_bytes = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
+    let meta = probe_mp4_metadata(input_path).unwrap_or(ClipMetadata {
+        duration_secs: (end_secs - start_secs).max(1.0),
+        width: 1920,
+        height: 1080,
+        fps: 60.0,
+    });
+
+    let t0 = Instant::now();
+    unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (balanced compressor) falló")?;
+
+    // Elegir un bitrate equilibrado y nítido que preserve 1080p/720p y 60 FPS originales.
+    let target_h = meta.height.min(1080);
+    let is_60fps = meta.fps >= 45.0;
+    let ideal_bps: u32 = match (target_h, is_60fps) {
+        (900.., true) => 4_800_000,  // 1080p 60fps (~18 MB / 30s) — muy nítido
+        (900.., false) => 3_400_000, // 1080p 30fps (~13 MB / 30s)
+        (_, true) => 3_000_000,      // 720p 60fps  (~11 MB / 30s)
+        (_, false) => 2_200_000,     // 720p 30fps  (~8 MB / 30s)
+    };
+
+    // Si el archivo original ya tiene un bitrate moderado, apuntar a ~55% del bitrate original
+    // (sin bajar de 2.2 Mbps para no sacrificar nitidez).
+    let src_bps = if meta.duration_secs > 0.5 && input_bytes > 0 {
+        ((input_bytes as f64 * 8.0) / meta.duration_secs) as u32
+    } else {
+        ideal_bps * 2
+    };
+    let video_bps = ideal_bps
+        .min((src_bps as f64 * 0.55) as u32)
+        .clamp(2_200_000, 5_500_000);
+    let audio_bps = 128_000u32;
+
+    let clip_dur = (end_secs - start_secs).max(0.5);
+    let expected_max_bytes =
+        (((video_bps + audio_bps) as f64 / 8.0) * clip_dur * 1.25) as u64;
+
+    let mut pass_res = compress_pass_with_opts(
+        input_path,
+        output_path,
+        video_bps,
+        audio_bps,
+        start_secs,
+        end_secs,
+        true,
+        true, // preservar FPS originales (60 fps)
+        Some(1080),
+    );
+
+    if pass_res.is_err() {
+        warn!("Compresión equilibrada GPU falló; reintentando en software CBR");
+        pass_res = compress_pass_with_opts(
+            input_path,
+            output_path,
+            video_bps,
+            audio_bps,
+            start_secs,
+            end_secs,
+            false,
+            true,
+            Some(1080),
+        );
+    }
+
+    // Si el driver GPU hizo overshoot significativo (>25% sobre lo esperado), aplicar pasada limpia.
+    if pass_res.is_ok() {
+        let actual_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        if actual_bytes > expected_max_bytes {
+            warn!(
+                expected_mb = format!("{:.1}", expected_max_bytes as f64 / (1024.0 * 1024.0)),
+                actual_mb = format!("{:.1}", actual_bytes as f64 / (1024.0 * 1024.0)),
+                "Compresión GPU excedió el bitrate objetivo; aplicando pasada CBR precisa"
+            );
+            let _ = std::fs::remove_file(output_path);
+            pass_res = compress_pass_with_opts(
+                input_path,
+                output_path,
+                video_bps,
+                audio_bps,
+                start_secs,
+                end_secs,
+                false,
+                true,
+                Some(1080),
+            );
+        }
+    }
+
+    unsafe {
+        let _ = MFShutdown();
+    }
+
+    let duration_secs = pass_res?;
+    let output_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    info!(
+        input = %input_path.display(),
+        output = %output_path.display(),
+        in_mb = format!("{:.2}", input_bytes as f64 / (1024.0 * 1024.0)),
+        out_mb = format!("{:.2}", output_bytes as f64 / (1024.0 * 1024.0)),
+        video_mbps = format!("{:.1}", video_bps as f64 / 1_000_000.0),
+        elapsed_ms = format!("{elapsed_ms:.0}"),
+        "Clip MP4 comprimido en modo equilibrado (alta calidad)"
+    );
+
+    Ok(TrimStats {
+        output_path: output_path.to_path_buf(),
+        input_bytes,
+        output_bytes,
+        duration_secs,
+        elapsed_ms,
+    })
+}
+
 /// Comprime un clip `.mp4` (o el rango `[start_secs, end_secs]`) usando Media Foundation con
 /// **rate-control CBR estricto vía `ICodecAPI`** + reducción inteligente de FPS/resolución y
 /// **verificación automática del tamaño final**: si el driver GPU excede el límite, aplica
 /// automáticamente una pasada correctiva para garantizar quedar por debajo de `target_mb`.
+#[allow(dead_code)]
 pub fn compress_mp4_to_target_mb(
     input_path: &Path,
     output_path: &Path,
@@ -462,6 +594,31 @@ fn compress_pass(
     end_secs: f64,
     use_hardware_encoder: bool,
 ) -> Result<f64> {
+    compress_pass_with_opts(
+        input_path,
+        output_path,
+        video_bitrate_bps,
+        audio_bps,
+        start_secs,
+        end_secs,
+        use_hardware_encoder,
+        false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compress_pass_with_opts(
+    input_path: &Path,
+    output_path: &Path,
+    video_bitrate_bps: u32,
+    audio_bps: u32,
+    start_secs: f64,
+    end_secs: f64,
+    use_hardware_encoder: bool,
+    preserve_fps: bool,
+    max_height_override: Option<u32>,
+) -> Result<f64> {
     let mut reader_attrs: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut reader_attrs, 2) }?;
     let reader_attrs = reader_attrs.context("MFCreateAttributes (reader) devolvió None")?;
@@ -520,10 +677,10 @@ fn compress_pass(
 
     let video_in_idx = video_in_idx.context("El archivo MP4 no contiene pista de video")?;
 
-    // Cuando el presupuesto es ajustado (<3.5 Mbps) y el video es de 60 fps, reducimos a 30 fps:
-    // duplica los bits disponibles por cuadro, mejora la nitidez y evita overshoot en GPU.
+    // Cuando el presupuesto es ajustado (<3.5 Mbps) y NO estamos en modo equilibrado (`preserve_fps`),
+    // reducimos de 60 fps a 30 fps para duplicar bits por cuadro.
     let src_fps = src_fps_num as f64 / src_fps_den.max(1) as f64;
-    let (out_fps_num, out_fps_den) = if src_fps > 35.0 && video_bitrate_bps < 3_500_000 {
+    let (out_fps_num, out_fps_den) = if !preserve_fps && src_fps > 35.0 && video_bitrate_bps < 3_500_000 {
         (30u32, 1u32)
     } else {
         (src_fps_num, src_fps_den)
@@ -535,8 +692,17 @@ fn compress_pass(
         0
     };
 
-    // Escalado inteligente cuando el bitrate por píxel es bajo.
-    let (out_w, out_h) = choose_compressed_dimensions(src_w, src_h, video_bitrate_bps);
+    // Escalado inteligente (o tope limpio en modo equilibrado, ej. 2K -> 1080p).
+    let (out_w, out_h) = if let Some(max_h) = max_height_override {
+        if src_h > max_h {
+            let scaled_w = ((src_w as f64 * max_h as f64) / src_h as f64).round() as u32;
+            ((scaled_w & !1).max(320), (max_h & !1).max(240))
+        } else {
+            (src_w & !1, src_h & !1)
+        }
+    } else {
+        choose_compressed_dimensions(src_w, src_h, video_bitrate_bps)
+    };
 
     // Configurar lector de video para entregar NV12 escalado en GPU.
     let reader_nv12 = unsafe { MFCreateMediaType() }?;
@@ -1141,6 +1307,37 @@ mod tests {
             out_mb <= 9.9,
             "El archivo comprimido superó el límite de Discord (<10 MB): {out_mb:.2} MB"
         );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn compresses_heavy_clip_balanced_if_present() {
+        let Ok(profile) = std::env::var("USERPROFILE") else {
+            return;
+        };
+        let candidate = PathBuf::from(profile)
+            .join("Videos")
+            .join("Bals")
+            .join("bals_20261125_002613.mp4");
+        if !candidate.exists() {
+            return;
+        }
+
+        let meta = probe_mp4_metadata(&candidate).expect("probe_mp4_metadata falló");
+        let out = std::env::temp_dir().join("bals_balanced_real_test.mp4");
+        let _ = std::fs::remove_file(&out);
+
+        let stats = compress_mp4_balanced(&candidate, &out, 0.0, meta.duration_secs)
+            .expect("compress_mp4_balanced falló");
+        let out_meta = probe_mp4_metadata(&out).expect("probe salida falló");
+        let in_mb = stats.input_bytes as f64 / (1024.0 * 1024.0);
+        let out_mb = stats.output_bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "REAL BALANCED TEST: {in_mb:.2} MB -> {out_mb:.2} MB ({}x{} @{:.0}fps) in {:.0} ms",
+            out_meta.width, out_meta.height, out_meta.fps, stats.elapsed_ms
+        );
+        assert!(stats.output_bytes < stats.input_bytes);
+        assert!(out_meta.height >= 720);
         let _ = std::fs::remove_file(&out);
     }
 }
