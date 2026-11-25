@@ -215,10 +215,17 @@ impl BalsUiApp {
 /// Abre la ventana nativa liviana de Bals (`eframe` + `glow`).
 /// Al cerrar la ventana, el proceso `--ui` termina y libera el 100% de su RAM y contexto GPU.
 pub fn run_gui() -> Result<()> {
+    let icon = egui::IconData {
+        rgba: include_bytes!("../../assets/icon_64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    };
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("Bals")
+            .with_icon(Arc::new(icon))
             .with_inner_size([800.0, 560.0])
             .with_min_inner_size([660.0, 460.0]),
         ..Default::default()

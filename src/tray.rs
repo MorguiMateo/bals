@@ -669,11 +669,12 @@ fn copy_utf16(dst: &mut [u16], src: &str) {
     }
 }
 
-/// Genera dos iconos 16x16 nítidos en memoria (verde esmeralda = espera, rojo = grabando)
-/// para evitar depender de archivos `.ico` externos.
+/// Genera los iconos 32x32 de la bandeja desde el icono oficial de Bals embebido en el binario:
+/// - `idle`: monitor CRT retro de Bals
+/// - `rec`: mismo monitor CRT con un indicador rojo de grabación en la esquina inferior derecha
 fn create_status_icons() -> (HICON, HICON, bool) {
-    let idle = build_circle_icon(34, 197, 94); // verde esmeralda
-    let rec = build_circle_icon(239, 68, 68); // rojo grabación
+    let idle = build_tray_icon(false);
+    let rec = build_tray_icon(true);
     match (idle, rec) {
         (Ok(i), Ok(r)) => (i, r, true),
         _ => {
@@ -683,34 +684,47 @@ fn create_status_icons() -> (HICON, HICON, bool) {
     }
 }
 
-fn build_circle_icon(r: u8, g: u8, b: u8) -> Result<HICON> {
-    const SIZE: usize = 16;
+fn build_tray_icon(recording_badge: bool) -> Result<HICON> {
+    const SIZE: usize = 32;
+    const RAW_RGBA: &[u8] = include_bytes!("../assets/icon_32.rgba");
+
     let mut color_bgra = vec![0u8; SIZE * SIZE * 4];
     let mut and_mask = vec![0xFFu8; SIZE * (SIZE / 8)];
 
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    let radius = 6.2f32;
-
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let dist = (dx * dx + dy * dy).sqrt();
             let idx = (y * SIZE + x) * 4;
-            if dist <= radius {
-                // Borde blanco suave alrededor del círculo para visibilidad en barra clara u oscura.
-                if dist > radius - 1.2 {
-                    color_bgra[idx] = 240;
-                    color_bgra[idx + 1] = 240;
-                    color_bgra[idx + 2] = 240;
-                    color_bgra[idx + 3] = 255;
-                } else {
-                    color_bgra[idx] = b;
-                    color_bgra[idx + 1] = g;
-                    color_bgra[idx + 2] = r;
-                    color_bgra[idx + 3] = 255;
+            let mut r = RAW_RGBA[idx];
+            let mut g = RAW_RGBA[idx + 1];
+            let mut b = RAW_RGBA[idx + 2];
+            let mut a = RAW_RGBA[idx + 3];
+
+            if recording_badge {
+                // Insignia roja de grabación (círculo nítido con borde blanco) abajo a la derecha.
+                let dx = x as f32 - 24.5;
+                let dy = y as f32 - 24.5;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist <= 6.8 {
+                    if dist > 5.0 {
+                        r = 250;
+                        g = 250;
+                        b = 250;
+                        a = 255;
+                    } else {
+                        r = 239;
+                        g = 68;
+                        b = 68;
+                        a = 255;
+                    }
                 }
-                // Bit 0 en AND mask = píxel opaco visible.
+            }
+
+            color_bgra[idx] = b;
+            color_bgra[idx + 1] = g;
+            color_bgra[idx + 2] = r;
+            color_bgra[idx + 3] = a;
+
+            if a > 20 {
                 let mask_byte = y * (SIZE / 8) + (x / 8);
                 let mask_bit = 7 - (x % 8);
                 and_mask[mask_byte] &= !(1u8 << mask_bit);

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/bals.png" width="128" alt="Bals" />
+</p>
+
 # Bals
 
 Cliper de videojuegos ultra-liviano para **Windows 10/11**, escrito en **Rust** con captura **Zero-Copy en GPU** y codificación nativa por hardware (**NVENC / AMD AMF / Intel QSV**), pensado para PCs de bajos recursos.
