@@ -12,15 +12,15 @@ use windows::Win32::Media::MediaFoundation::{
     MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
     MFAudioFormat_AAC, MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFCreateSinkWriterFromURL, MFMediaType_Audio, MFMediaType_Video, MFSampleExtension_CleanPoint,
-    MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264, MFVideoFormat_HEVC,
-    MFVideoInterlace_Progressive, eAVEncH264VProfile_High, eAVEncH265VProfile_Main_420_8,
+    MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
+    MFVideoInterlace_Progressive, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::HSTRING;
 
 use crate::buffer::ClipSnapshot;
-use crate::config::{VideoCodec, VideoConfig};
-use crate::encode::annexb_contains_headers_for;
+use crate::config::VideoConfig;
+use crate::encode::annexb_contains_headers;
 
 /// Estadísticas de un archivo MP4 recién guardado.
 #[derive(Debug, Clone)]
@@ -111,24 +111,20 @@ fn write_mp4_inner(
             )
         })?;
 
-    // 1. Pista de video H.264 o H.265/HEVC (passthrough).
+    // 1. Pista de video H.264 (passthrough).
     let (width, height) = video_config.resolution.dimensions();
     let fps = video_config.fps.as_u32();
 
     let video_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (video) falló")?;
     unsafe {
         video_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        let (subtype, profile) = match video_config.codec {
-            VideoCodec::H264 => (&MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32),
-            VideoCodec::Hevc => (&MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
-        };
-        video_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
+        video_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
         video_type.SetUINT32(&MF_MT_AVG_BITRATE, video_config.bitrate_bps)?;
         video_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         video_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
         video_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
         video_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
-        video_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
+        video_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
 
         if let Some(sps_pps) = &snapshot.sps_pps_annexb {
             video_type.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, sps_pps)?;
@@ -136,14 +132,9 @@ fn write_mp4_inner(
     }
 
     let video_stream_idx = unsafe { sink_writer.AddStream(&video_type) }
-        .with_context(|| format!("IMFSinkWriter::AddStream ({}) falló", video_config.codec))?;
+        .context("IMFSinkWriter::AddStream (H.264) falló")?;
     unsafe { sink_writer.SetInputMediaType(video_stream_idx, &video_type, None) }
-        .with_context(|| {
-            format!(
-                "IMFSinkWriter::SetInputMediaType (passthrough {}) falló",
-                video_config.codec
-            )
-        })?;
+        .context("IMFSinkWriter::SetInputMediaType (passthrough H.264) falló")?;
 
     // 2. Pista de audio AAC-LC (passthrough) si el snapshot contiene audio.
     let audio_stream_idx = if let (Some(audio_info), false) =
@@ -230,7 +221,7 @@ fn write_mp4_inner(
             };
 
             let payload: std::borrow::Cow<'_, [u8]> =
-                if v_idx == 0 && !annexb_contains_headers_for(&pkt.data, video_config.codec) {
+                if v_idx == 0 && !annexb_contains_headers(&pkt.data) {
                     if let Some(sps_pps) = &snapshot.sps_pps_annexb {
                         let mut combined = Vec::with_capacity(sps_pps.len() + pkt.data.len());
                         combined.extend_from_slice(sps_pps);

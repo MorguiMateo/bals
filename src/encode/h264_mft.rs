@@ -23,45 +23,38 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFMediaType_Video, MFSampleExtension_CleanPoint, MFVideoFormat_H264,
-    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
-    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_High, eAVEncH265VProfile_Main_420_8,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncCommonRateControlMode_Quality,
+    eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, IUnknown, Interface};
 
-use crate::config::{EncoderPreference, VideoCodec, VideoConfig};
+use crate::config::{EncoderPreference, VideoConfig};
 use crate::d3d::SharedD3DDevice;
-use crate::encode::{EncodedVideoPacket, annexb_contains_idr_for};
+use crate::encode::{EncodedVideoPacket, annexb_contains_idr};
 
-/// Resumen de encoders de video (H.264 + H.265/HEVC) disponibles en el sistema.
+/// Resumen de encoders de video H.264 disponibles en el sistema.
 #[derive(Debug, Clone, Default)]
 pub struct DetectedEncoders {
     pub hw_name: Option<String>,
     pub hw_short: Option<String>,
     pub sw_name: Option<String>,
-    pub hevc_hw_name: Option<String>,
-    pub hevc_hw_available: bool,
 }
 
-/// Enumera los encoders de video H.264 y HEVC (Hardware GPU y Software CPU) en Media Foundation.
+/// Enumera los encoders de video H.264 (Hardware GPU y Software CPU) en Media Foundation.
 pub fn detect_system_encoders() -> DetectedEncoders {
     let mut out = DetectedEncoders::default();
     if unsafe { MFStartup(MF_VERSION, 0) }.is_err() {
         return out;
     }
 
-    if let Some(hw) = first_enumerated_encoder_name(VideoCodec::H264, true) {
+    if let Some(hw) = first_enumerated_encoder_name(true) {
         out.hw_short = Some(short_hw_label(&hw));
         out.hw_name = Some(hw);
     }
-    out.sw_name = first_enumerated_encoder_name(VideoCodec::H264, false);
-
-    if let Some(hevc_hw) = first_enumerated_encoder_name(VideoCodec::Hevc, true) {
-        out.hevc_hw_available = true;
-        out.hevc_hw_name = Some(hevc_hw);
-    }
+    out.sw_name = first_enumerated_encoder_name(false);
 
     unsafe {
         let _ = MFShutdown();
@@ -95,17 +88,10 @@ fn vendor_token(text: &str) -> Option<&'static str> {
     }
 }
 
-fn codec_subtype(codec: VideoCodec) -> GUID {
-    match codec {
-        VideoCodec::H264 => MFVideoFormat_H264,
-        VideoCodec::Hevc => MFVideoFormat_HEVC,
-    }
-}
-
-fn first_enumerated_encoder_name(codec: VideoCodec, hardware: bool) -> Option<String> {
+fn first_enumerated_encoder_name(hardware: bool) -> Option<String> {
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: codec_subtype(codec),
+        guidSubtype: MFVideoFormat_H264,
     };
     let flags = if hardware {
         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
@@ -147,7 +133,7 @@ fn first_enumerated_encoder_name(codec: VideoCodec, hardware: bool) -> Option<St
     found
 }
 
-/// Encoder de video (H.264 o HEVC/H.265) por Hardware vía Windows Media Foundation
+/// Encoder de video H.264 por Hardware vía Windows Media Foundation
 /// (NVIDIA NVENC / AMD AMF / Intel QSV), con emparejamiento de adaptador D3D11 para GPUs
 /// híbridas, Zero-Copy sobre texturas D3D11 `NV12` y fallback automático a software.
 pub struct H264Encoder {
@@ -157,7 +143,6 @@ pub struct H264Encoder {
     _dxgi_manager: Option<IMFDXGIDeviceManager>,
     #[allow(dead_code)]
     pub name: String,
-    pub active_codec: VideoCodec,
     #[allow(dead_code)]
     pub is_hardware: bool,
     pub is_async: bool,
@@ -186,65 +171,34 @@ impl H264Encoder {
         }
     }
 
-    /// Intenta activar el codec y backend elegidos; si HEVC hardware no está disponible
-    /// en el equipo (o el usuario eligió CPU Software con HEVC), cae limpiamente a H.264.
+    /// Intenta activar el backend H.264 elegido (GPU hardware y/o fallback a CPU software).
     fn init_with_fallbacks(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
-        let mut attempts: Vec<(VideoCodec, bool)> = Vec::new();
-        match (config.codec, config.encoder_pref) {
-            (VideoCodec::Hevc, EncoderPreference::HardwareGpu) => {
-                attempts.push((VideoCodec::Hevc, true));
-                attempts.push((VideoCodec::H264, true));
-            }
-            (VideoCodec::Hevc, EncoderPreference::AutoGpu) => {
-                attempts.push((VideoCodec::Hevc, true));
-                attempts.push((VideoCodec::H264, true));
-                attempts.push((VideoCodec::H264, false));
-            }
-            (VideoCodec::Hevc, EncoderPreference::SoftwareCpu) => {
-                // Media Foundation no incluye encoder HEVC por CPU de serie; usar H.264 SW.
-                attempts.push((VideoCodec::H264, false));
-            }
-            (VideoCodec::H264, EncoderPreference::HardwareGpu) => {
-                attempts.push((VideoCodec::H264, true));
-            }
-            (VideoCodec::H264, EncoderPreference::AutoGpu) => {
-                attempts.push((VideoCodec::H264, true));
-                attempts.push((VideoCodec::H264, false));
-            }
-            (VideoCodec::H264, EncoderPreference::SoftwareCpu) => {
-                attempts.push((VideoCodec::H264, false));
-            }
-        }
+        let attempts: &[bool] = match config.encoder_pref {
+            EncoderPreference::HardwareGpu => &[true],
+            EncoderPreference::AutoGpu => &[true, false],
+            EncoderPreference::SoftwareCpu => &[false],
+        };
 
         let mut last_err = None;
-        for (codec, hardware) in attempts {
-            let mut effective_cfg = config;
-            effective_cfg.codec = codec;
-            effective_cfg.bitrate_bps = VideoConfig::recommended_bitrate_for_codec(
-                config.resolution,
-                config.fps,
-                config.quality,
-                codec,
-            );
-            match Self::init_inner(d3d, effective_cfg, hardware) {
+        for &hardware in attempts {
+            match Self::init_inner(d3d, config, hardware) {
                 Ok(enc) => return Ok(enc),
                 Err(err) => {
                     warn!(
-                        codec = %codec,
                         hardware,
-                        "No se pudo iniciar encoder ({err:#}); probando siguiente opción"
+                        "No se pudo iniciar encoder H.264 ({err:#}); probando siguiente opción"
                     );
                     last_err = Some(err);
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No se encontró ningún encoder de video")))
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No se encontró ningún encoder H.264")))
     }
 
     fn init_inner(d3d: &SharedD3DDevice, config: VideoConfig, hardware: bool) -> Result<Self> {
         let preferred_vendor = vendor_token(&d3d.adapter_name);
-        let candidates = enumerate_mft_candidates(config.codec, hardware, preferred_vendor)?;
+        let candidates = enumerate_mft_candidates(hardware, preferred_vendor)?;
 
         let mut last_err = None;
         for (activate, name) in candidates {
@@ -297,27 +251,23 @@ impl H264Encoder {
             dxgi_manager = Some(mgr);
         }
 
-        // Configurar tipo de salida (H.264 o HEVC) y entrada (NV12).
+        // Configurar tipo de salida (H.264) y entrada (NV12).
         let (width, height) = config.resolution.dimensions();
         let fps = config.fps.as_u32();
 
         let output_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (out) falló")?;
         unsafe {
             output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            output_type.SetGUID(&MF_MT_SUBTYPE, &codec_subtype(config.codec))?;
+            output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
             output_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_bps)?;
             output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
             output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
             output_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
-            let profile = match config.codec {
-                VideoCodec::H264 => eAVEncH264VProfile_High.0 as u32,
-                VideoCodec::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
-            };
-            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
+            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
             mft.SetOutputType(0, &output_type, 0)
         }
-        .with_context(|| format!("SetOutputType ({}) falló en {name}", config.codec))?;
+        .with_context(|| format!("SetOutputType (H.264) falló en {name}"))?;
 
         let input_type = unsafe { MFCreateMediaType() }.context("MFCreateMediaType (in) falló")?;
         unsafe {
@@ -358,7 +308,6 @@ impl H264Encoder {
 
         info!(
             encoder = %name,
-            codec = %config.codec,
             adapter = %d3d.adapter_name,
             hardware = is_hardware,
             async_mft = is_async,
@@ -367,7 +316,7 @@ impl H264Encoder {
             fps = %config.fps,
             bitrate_mbps = format!("{:.1}", config.bitrate_bps as f64 / 1_000_000.0),
             gop_frames = config.gop_frames(),
-            "Encoder de video Media Foundation iniciado"
+            "Encoder H.264 Media Foundation iniciado"
         );
 
         let codec_api = mft.cast::<ICodecAPI>().ok();
@@ -378,7 +327,6 @@ impl H264Encoder {
             event_gen,
             _dxgi_manager: dxgi_manager,
             name,
-            active_codec: config.codec,
             is_hardware,
             is_async,
             mft_provides_output_samples,
@@ -392,16 +340,12 @@ impl H264Encoder {
         })
     }
 
-    /// Etiqueta corta del encoder y codec activos para mostrar en el HUD de la consola retro.
+    /// Etiqueta corta del encoder H.264 activo para mostrar en el HUD de la consola retro.
     pub fn hardware_label(&self) -> String {
-        let codec_tag = match self.active_codec {
-            VideoCodec::H264 => "H.264",
-            VideoCodec::Hevc => "H.265",
-        };
         if !self.is_hardware {
-            return format!("CPU SW · {codec_tag}");
+            return "CPU SW · H.264".to_string();
         }
-        format!("{} · {codec_tag}", short_hw_label(&self.name))
+        format!("{} · H.264", short_hw_label(&self.name))
     }
 
     /// Solicita explícitamente un Keyframe (IDR) al encoder para el próximo frame.
@@ -627,7 +571,7 @@ impl H264Encoder {
             return Ok(None);
         }
 
-        let is_keyframe = clean_point || annexb_contains_idr_for(&data, self.active_codec);
+        let is_keyframe = clean_point || annexb_contains_idr(&data);
 
         Ok(Some(EncodedVideoPacket {
             data,
@@ -651,13 +595,12 @@ impl Drop for H264Encoder {
 /// Enumera candidatos MFT priorizando el fabricante del adaptador D3D11 activo
 /// (crítico en laptops/PCs híbridas Intel + NVIDIA para enlazar NVENC con la GPU NVIDIA).
 fn enumerate_mft_candidates(
-    codec: VideoCodec,
     hardware: bool,
     preferred_vendor: Option<&'static str>,
 ) -> Result<Vec<(IMFActivate, String)>> {
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: codec_subtype(codec),
+        guidSubtype: MFVideoFormat_H264,
     };
 
     let flags = if hardware {
@@ -682,14 +625,14 @@ fn enumerate_mft_candidates(
     .context("MFTEnumEx falló")?;
 
     if count == 0 || raw_activates.is_null() {
-        bail!("MFTEnumEx devolvió 0 encoders {} (hardware={hardware})", codec);
+        bail!("MFTEnumEx devolvió 0 encoders H.264 (hardware={hardware})");
     }
 
     let mut list: Vec<(IMFActivate, String)> = Vec::with_capacity(count as usize);
     let slice = unsafe { std::slice::from_raw_parts_mut(raw_activates, count as usize) };
     for slot in slice.iter_mut() {
         if let Some(activate) = slot.take() {
-            let friendly = get_friendly_name(&activate).unwrap_or_else(|| format!("{codec} MFT"));
+            let friendly = get_friendly_name(&activate).unwrap_or_else(|| "H.264 MFT".to_string());
             list.push((activate, friendly));
         }
     }

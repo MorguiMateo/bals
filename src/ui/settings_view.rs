@@ -4,7 +4,7 @@ use eframe::egui::{self, Sense, Stroke, StrokeKind, vec2};
 
 use crate::config::{
     AudioCaptureMode, CaptureMode, EncoderPreference, FrameRate, QualityPreset, ReplayDuration,
-    Resolution, UiTheme, VideoCodec, VideoConfig,
+    Resolution, UiTheme, VideoConfig,
 };
 use crate::hotkey::parse_hotkey;
 use crate::ui::theme::RetroPalette;
@@ -42,16 +42,12 @@ pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPale
 }
 
 fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
-    let codec_tag = match app.cfg.video_codec {
-        VideoCodec::H264 => "H.264",
-        VideoCodec::Hevc => "H.265",
-    };
     let hw_badge = app
         .detected_encoders
         .hw_short
         .as_deref()
-        .map(|s| format!("{codec_tag} · {s}"))
-        .unwrap_or_else(|| format!("{codec_tag} SW"));
+        .map(|s| format!("H.264 · {s}"))
+        .unwrap_or_else(|| "H.264 SW".to_string());
 
     retro_card(
         ui,
@@ -60,10 +56,11 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
         Some(&hw_badge),
         |ui| {
             let row_w = ui.available_width();
+            let sp = ui.spacing().item_spacing.x;
 
             // Resolución (3 píldoras)
             ui.label(egui::RichText::new("RESOLUCIÓN").size(10.0).color(p.crt_muted));
-            let w3 = ((row_w - 14.0) / 3.0).max(70.0);
+            let w3 = ((row_w - sp * 2.0) / 3.0).max(70.0);
             ui.horizontal(|ui| {
                 if retro_pill(ui, p, app.cfg.resolution == Resolution::P720, "720p", vec2(w3, 22.0)).clicked() {
                     app.cfg.resolution = Resolution::P720;
@@ -78,9 +75,10 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
 
             // FPS (2 píldoras) + Calidad QVBR (3 píldoras)
             ui.label(egui::RichText::new("FPS Y CALIDAD (QVBR)").size(10.0).color(p.crt_muted));
-            let w_fps = ((row_w - 7.0) * 0.36).max(115.0);
-            let w_fps_btn = ((w_fps - 5.0) / 2.0).max(52.0);
-            let w_qual = ((row_w - w_fps - 18.0) / 3.0).max(60.0);
+            let gap = 4.0;
+            let usable = row_w - sp * 4.0 - gap;
+            let w_fps_btn = ((usable * 0.36) / 2.0).max(52.0);
+            let w_qual = ((usable - w_fps_btn * 2.0) / 3.0).max(60.0);
             ui.horizontal(|ui| {
                 if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps30, "30 FPS", vec2(w_fps_btn, 22.0)).clicked() {
                     app.cfg.fps = FrameRate::Fps30;
@@ -88,7 +86,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps60, "60 FPS", vec2(w_fps_btn, 22.0)).clicked() {
                     app.cfg.fps = FrameRate::Fps60;
                 }
-                ui.add_space(4.0);
+                ui.add_space(gap);
                 if retro_pill(
                     ui,
                     p,
@@ -125,20 +123,9 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            // Codec (H.264 / H.265 HEVC) + Encoder (AUTO / GPU / CPU)
-            ui.label(egui::RichText::new("CODEC Y ENCODER").size(10.0).color(p.crt_muted));
-            let hevc_avail = app.detected_encoders.hevc_hw_available;
-            let hevc_hover = app
-                .detected_encoders
-                .hevc_hw_name
-                .as_deref()
-                .map(|n| format!("~32% menos peso y RAM con igual nitidez ({n})"))
-                .unwrap_or_else(|| "Tu GPU no expone encoder HEVC (H.265) por hardware".to_string());
-
-            let w_codec_grp = ((row_w - 10.0) * 0.41).max(142.0);
-            let w_h264 = ((w_codec_grp - 6.0) * 0.46).max(60.0);
-            let w_hevc = (w_codec_grp - w_h264 - 6.0).max(74.0);
-            let w_enc_btn = ((row_w - w_codec_grp - 22.0) / 3.0).max(58.0);
+            // Encoder H.264 (AUTO / GPU HW / CPU SW)
+            ui.label(egui::RichText::new("ENCODER H.264").size(10.0).color(p.crt_muted));
+            let w_enc_btn = ((row_w - sp * 2.0) / 3.0).max(70.0);
 
             let gpu_pill_label = app
                 .detected_encoders
@@ -149,41 +136,21 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 .detected_encoders
                 .hw_name
                 .as_deref()
-                .map(|n| format!("Codificación por hardware en tu gráfica: {n}"))
-                .unwrap_or_else(|| "No se detectó encoder por hardware".to_string());
+                .map(|n| format!("Codificación H.264 por hardware en tu gráfica: {n}"))
+                .unwrap_or_else(|| "No se detectó encoder H.264 por hardware".to_string());
             let sw_hover = app
                 .detected_encoders
                 .sw_name
                 .as_deref()
-                .map(|n| format!("Codificación por CPU (software): {n}"))
-                .unwrap_or_else(|| "Codificación por CPU (Microsoft H.264 MFT)".to_string());
+                .map(|n| format!("Codificación H.264 por CPU (software): {n}"))
+                .unwrap_or_else(|| "Codificación H.264 por CPU (Microsoft H.264 MFT)".to_string());
 
             ui.horizontal(|ui| {
-                if retro_pill(ui, p, app.cfg.video_codec == VideoCodec::H264, "H.264", vec2(w_h264, 22.0))
-                    .on_hover_text("Máxima compatibilidad universal (Discord, WhatsApp, web)")
-                    .clicked()
-                {
-                    app.cfg.video_codec = VideoCodec::H264;
-                }
-                ui.add_enabled_ui(hevc_avail, |ui| {
-                    if retro_pill(ui, p, app.cfg.video_codec == VideoCodec::Hevc, "H.265", vec2(w_hevc, 22.0))
-                        .on_hover_text(&hevc_hover)
-                        .clicked()
-                    {
-                        app.cfg.video_codec = VideoCodec::Hevc;
-                        if app.cfg.encoder_pref == EncoderPreference::SoftwareCpu {
-                            app.cfg.encoder_pref = EncoderPreference::AutoGpu;
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-
                 if retro_pill(
                     ui,
                     p,
                     app.cfg.encoder_pref == EncoderPreference::AutoGpu,
-                    "AUTO",
+                    "AUTO (GPU)",
                     vec2(w_enc_btn, 22.0),
                 )
                 .on_hover_text("Usa tu gráfica automáticamente (fallback a CPU si falla)")
@@ -209,20 +176,19 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     ui,
                     p,
                     app.cfg.encoder_pref == EncoderPreference::SoftwareCpu,
-                    "CPU",
+                    "CPU (SW)",
                     vec2(w_enc_btn, 22.0),
                 )
                 .on_hover_text(&sw_hover)
                 .clicked()
                 {
                     app.cfg.encoder_pref = EncoderPreference::SoftwareCpu;
-                    app.cfg.video_codec = VideoCodec::H264;
                 }
             });
 
             // Duración del Replay Buffer (4 píldoras)
             ui.label(egui::RichText::new("REPLAY BUFFER EN RAM").size(10.0).color(p.crt_muted));
-            let w4 = ((row_w - 21.0) / 4.0).max(52.0);
+            let w4 = ((row_w - sp * 3.0) / 4.0).max(52.0);
             ui.horizontal(|ui| {
                 for (dur, lbl) in [
                     (ReplayDuration::Sec15, "15s"),
@@ -237,19 +203,17 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
             });
 
             ui.add_space(4.0);
-            let bitrate_bps = VideoConfig::recommended_bitrate_for_codec(
+            let bitrate_bps = VideoConfig::recommended_bitrate_for(
                 app.cfg.resolution,
                 app.cfg.fps,
                 app.cfg.quality,
-                app.cfg.video_codec,
             );
             let est_ram_mb = (bitrate_bps as f64 / 8.0) * app.cfg.replay_duration.as_secs() as f64
                 / (1024.0 * 1024.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "{:.1} Mbps ({}) · ~{:.1} MB RAM · 0 MB/s DISCO",
+                    "{:.1} Mbps (H.264) · ~{:.1} MB RAM · 0 MB/s DISCO",
                     bitrate_bps as f64 / 1_000_000.0,
-                    codec_tag,
                     est_ram_mb
                 ))
                 .size(10.8)
@@ -367,15 +331,20 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
 }
 
 fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
+    let mode_badge = match app.cfg.capture_mode {
+        CaptureMode::AutoDetectGames => "0% GPU IDLE",
+        CaptureMode::ManualMonitor => "MONITOR AUTO",
+    };
+
     retro_card(
         ui,
         p,
         "MODO & ATAJO GLOBAL",
-        Some("0% GPU IDLE"),
+        Some(mode_badge),
         |ui| {
             let row_w = ui.available_width();
-            let w_auto = (row_w * 0.62 - 4.0).max(140.0);
-            let w_man = (row_w - w_auto - 7.0).max(80.0);
+            let sp = ui.spacing().item_spacing.x;
+            let w_mode = ((row_w - sp) / 2.0).max(110.0);
 
             ui.horizontal(|ui| {
                 if retro_pill(
@@ -383,7 +352,7 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                     p,
                     app.cfg.capture_mode == CaptureMode::AutoDetectGames,
                     "AUTO-JUEGOS",
-                    vec2(w_auto, 25.0),
+                    vec2(w_mode, 25.0),
                 )
                 .on_hover_text("Inicia automáticamente al abrir un juego y libera 100% GPU en escritorio")
                 .clicked()
@@ -394,19 +363,81 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                     ui,
                     p,
                     app.cfg.capture_mode == CaptureMode::ManualMonitor,
-                    "MANUAL",
-                    vec2(w_man, 25.0),
+                    "MONITOR (PANTALLA)",
+                    vec2(w_mode, 25.0),
                 )
+                .on_hover_text("Graba automáticamente toda la pantalla seleccionada en lugar de detectar juegos")
                 .clicked()
                 {
                     app.cfg.capture_mode = CaptureMode::ManualMonitor;
+                    if app.monitors.is_empty() {
+                        app.refresh_monitors();
+                    }
                 }
             });
+
+            if app.cfg.capture_mode == CaptureMode::ManualMonitor {
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PANTALLA A GRABAR (INICIO AUTOMÁTICO)")
+                            .size(10.0)
+                            .color(p.crt_muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if retro_pill(ui, p, false, "ACT", vec2(38.0, 18.0))
+                            .on_hover_text("Volver a detectar monitores conectados")
+                            .clicked()
+                        {
+                            app.refresh_monitors();
+                        }
+                    });
+                });
+
+                if app.monitors.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Usando monitor principal del sistema.")
+                            .size(11.0)
+                            .color(p.crt_muted),
+                    );
+                } else {
+                    let selected_dev = app.cfg.selected_monitor.as_deref();
+                    let per_row = app.monitors.len().clamp(1, 2);
+                    let pill_w = ((row_w - sp * (per_row as f32 - 1.0)) / per_row as f32).max(120.0);
+                    let mut chosen_dev: Option<String> = None;
+
+                    for chunk in app.monitors.chunks(2) {
+                        ui.horizontal(|ui| {
+                            for m in chunk {
+                                let is_sel = match selected_dev {
+                                    Some(dev) => m.device_name.eq_ignore_ascii_case(dev),
+                                    None => m.is_primary || m.index == 1,
+                                };
+                                let hover = if m.is_primary {
+                                    format!("Monitor principal ({})", m.device_name)
+                                } else {
+                                    format!("Monitor secundario ({})", m.device_name)
+                                };
+                                if retro_pill(ui, p, is_sel, &m.ui_label(), vec2(pill_w, 22.0))
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    chosen_dev = Some(m.device_name.clone());
+                                }
+                            }
+                        });
+                    }
+
+                    if let Some(dev) = chosen_dev {
+                        app.cfg.selected_monitor = Some(dev);
+                    }
+                }
+            }
 
             ui.add_space(6.0);
             ui.label(egui::RichText::new("TECLA PARA GUARDAR CLIP").size(10.5).color(p.crt_muted));
 
-            // Keycap estilizada + botón interactivo "CAMBIAR TECLA" + edición manual
+            // Keycap estilizada + botón interactivo "ASIGNAR TECLA" + edición manual
             ui.horizontal(|ui| {
                 let key_display = if app.listening_hotkey {
                     "...".to_string()
@@ -435,7 +466,7 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                 } else {
                     "ASIGNAR TECLA"
                 };
-                let btn_w = (ui.available_width() - 88.0).max(115.0);
+                let btn_w = (ui.available_width() - 74.0 - sp - 6.0).max(115.0);
                 if retro_pill(ui, p, app.listening_hotkey, bind_lbl, vec2(btn_w, 28.0)).clicked() {
                     app.listening_hotkey = !app.listening_hotkey;
                 }
@@ -483,11 +514,13 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
         "CARPETA, TEMA & SISTEMA",
         Some(&format!("v{CURRENT_VERSION}")),
         |ui| {
+            let sp = ui.spacing().item_spacing.x;
+
             // Carpeta de clips
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("CLIPS:").size(11.0).color(p.crt_muted));
                 let mut dir_str = app.cfg.clips_dir.to_string_lossy().into_owned();
-                let input_w = (ui.available_width() - 78.0).max(120.0);
+                let input_w = (ui.available_width() - 66.0 - sp - 6.0).max(120.0);
                 if ui
                     .add(egui::TextEdit::singleline(&mut dir_str).desired_width(input_w))
                     .changed()
@@ -503,10 +536,11 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
             // Juegos extra en modo ventana
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("EXES: ").size(11.0).color(p.crt_muted));
+                let input_w = (ui.available_width() - 6.0).max(120.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.extra_games_text)
                         .hint_text("ej: javaw.exe, valorant.exe")
-                        .desired_width(ui.available_width()),
+                        .desired_width(input_w),
                 );
             });
 
@@ -515,8 +549,9 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
             // Selector de Tema Retro + toggle Scanlines CRT
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("TEMA:").size(10.5).color(p.crt_muted));
-                let avail = (ui.available_width() - 96.0).max(160.0);
-                let tw = ((avail - 18.0) / 4.0).max(48.0);
+                let crt_w = 56.0;
+                let avail = (ui.available_width() - crt_w - sp * 4.0).max(160.0);
+                let tw = (avail / 4.0).max(40.0);
                 for theme in UiTheme::ALL {
                     if retro_pill(
                         ui,
@@ -538,7 +573,7 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
             // Botón principal [ GUARDAR Y APLICAR ] + Auto-updater
             let avail_w = ui.available_width();
             ui.horizontal(|ui| {
-                let save_w = (avail_w * 0.60).max(165.0);
+                let save_w = ((avail_w - sp) * 0.62).max(165.0);
                 if retro_pill(ui, p, true, "[ GUARDAR Y APLICAR ]", vec2(save_w, 30.0))
                     .on_hover_text("Guarda config.toml y aplica al instante (Ctrl+S)")
                     .clicked()
@@ -546,7 +581,7 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                     app.save_config();
                 }
 
-                let upd_w = (avail_w - save_w - 8.0).max(90.0);
+                let upd_w = (avail_w - save_w - sp).max(86.0);
                 if retro_pill(ui, p, false, "UPDATES", vec2(upd_w, 30.0))
                     .on_hover_text("Buscar nueva versión en GitHub Releases")
                     .clicked()

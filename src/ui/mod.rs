@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::audio::meter::AudioLevelMonitor;
+use crate::capture::{MonitorInfo, list_monitors};
 use crate::config::{AppConfig, UiTheme};
 use crate::encode::h264_mft::{DetectedEncoders, detect_system_encoders};
 use crate::hotkey::parse_hotkey;
@@ -84,8 +85,9 @@ pub(crate) struct BalsUiApp {
     pub last_telemetry_poll: Instant,
     pub last_clip_event_seq: u32,
 
-    // Auto-updater, encoders detectados y audio VU continuo (sin peak-hold desconectado)
+    // Auto-updater, encoders detectados, monitores conectados y audio VU continuo
     pub detected_encoders: DetectedEncoders,
+    pub monitors: Vec<MonitorInfo>,
     pub update_state: Arc<Mutex<UpdateUiState>>,
     pub audio_meter: AudioLevelMonitor,
     pub desktop_vu_display: f32,
@@ -126,6 +128,7 @@ impl BalsUiApp {
         let telemetry = ipc::read_engine_telemetry();
         let last_clip_event_seq = telemetry.as_ref().map_or(0, |t| t.clip_event_seq);
         let detected_encoders = detect_system_encoders();
+        let monitors = list_monitors();
 
         // Cargar ícono CRT 64×64 pixel-art con filtrado NEAREST (sin blur).
         let raw_icon = include_bytes!("../../assets/icon_64.rgba");
@@ -150,6 +153,7 @@ impl BalsUiApp {
             last_telemetry_poll: Instant::now(),
             last_clip_event_seq,
             detected_encoders,
+            monitors,
             update_state: Arc::new(Mutex::new(UpdateUiState::Idle)),
             audio_meter: AudioLevelMonitor::start(),
             desktop_vu_display: 0.0,
@@ -182,6 +186,10 @@ impl BalsUiApp {
 
     pub fn set_banner(&mut self, msg: impl Into<String>, is_err: bool) {
         self.banner_msg = Some((msg.into(), is_err, Instant::now()));
+    }
+
+    pub fn refresh_monitors(&mut self) {
+        self.monitors = list_monitors();
     }
 
     pub fn refresh_clips(&mut self) {
@@ -605,8 +613,8 @@ pub fn run_gui() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Bals")
             .with_icon(Arc::new(icon))
-            .with_inner_size([980.0, 650.0])
-            .with_min_inner_size([860.0, 580.0]),
+            .with_inner_size([1080.0, 680.0])
+            .with_min_inner_size([960.0, 620.0]),
         ..Default::default()
     };
 
@@ -905,14 +913,21 @@ fn draw_live_telemetry_lcd(
     } else if let Some(t) = telemetry {
         match t.state {
             TelemetryState::Idle => ("STANDBY · 0% GPU".to_string(), p.led_green, false),
-            TelemetryState::RecordingManual => (
-                format!(
-                    "REC {:.0}s/{}s · {:.0}MB",
-                    t.buffered_secs, t.replay_target_secs, t.buffer_ram_mb
-                ),
-                p.led_red,
-                true,
-            ),
+            TelemetryState::RecordingManual => {
+                let target = if t.game_name.is_empty() {
+                    "MONITOR"
+                } else {
+                    t.game_name.as_str()
+                };
+                (
+                    format!(
+                        "{target} {:.0}s/{}s · {:.0}MB",
+                        t.buffered_secs, t.replay_target_secs, t.buffer_ram_mb
+                    ),
+                    p.led_red,
+                    true,
+                )
+            }
             TelemetryState::RecordingGame => {
                 let g = if t.game_name.len() > 12 {
                     &t.game_name[..12]

@@ -111,40 +111,7 @@ impl fmt::Display for QualityPreset {
     }
 }
 
-/// Codec de video utilizado para grabar los clips en el Replay Buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum VideoCodec {
-    /// H.264 (AVC): máxima compatibilidad universal (Discord, WhatsApp, navegadores).
-    #[default]
-    H264,
-    /// H.265 (HEVC): ~32% menos peso y RAM con la misma nitidez visual (GPU moderna).
-    Hevc,
-}
-
-impl VideoCodec {
-    pub const fn label(self) -> &'static str {
-        match self {
-            VideoCodec::H264 => "H.264",
-            VideoCodec::Hevc => "H.265 (HEVC)",
-        }
-    }
-
-    /// Factor de bitrate relativo respecto a H.264 para mantener igual o mayor nitidez.
-    pub const fn bitrate_scale_pct(self) -> u32 {
-        match self {
-            VideoCodec::H264 => 100,
-            VideoCodec::Hevc => 68,
-        }
-    }
-}
-
-impl fmt::Display for VideoCodec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.label())
-    }
-}
-
-/// Preferencia de encoder de video.
+/// Preferencia de encoder de video H.264.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EncoderPreference {
     /// Automático: prioriza GPU por hardware (AMD AMF / NVIDIA NVENC / Intel QSV), con fallback a CPU.
@@ -172,13 +139,12 @@ impl fmt::Display for EncoderPreference {
     }
 }
 
-/// Configuración de video del encoder H.264 / HEVC.
+/// Configuración de video del encoder H.264.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoConfig {
     pub resolution: Resolution,
     pub fps: FrameRate,
     pub quality: QualityPreset,
-    pub codec: VideoCodec,
     /// Bitrate promedio objetivo en bits por segundo.
     pub bitrate_bps: u32,
     /// Intervalo de keyframes (IDR) en segundos (2 s es ideal para replay buffer).
@@ -199,28 +165,20 @@ impl VideoConfig {
         fps: FrameRate,
         quality: QualityPreset,
     ) -> Self {
-        Self::preset_full(
-            resolution,
-            fps,
-            quality,
-            VideoCodec::H264,
-            EncoderPreference::AutoGpu,
-        )
+        Self::preset_full(resolution, fps, quality, EncoderPreference::AutoGpu)
     }
 
     pub const fn preset_full(
         resolution: Resolution,
         fps: FrameRate,
         quality: QualityPreset,
-        codec: VideoCodec,
         encoder_pref: EncoderPreference,
     ) -> Self {
-        let bitrate_bps = Self::recommended_bitrate_for_codec(resolution, fps, quality, codec);
+        let bitrate_bps = Self::recommended_bitrate_for(resolution, fps, quality);
         Self {
             resolution,
             fps,
             quality,
-            codec,
             bitrate_bps,
             gop_secs: 2,
             encoder_pref,
@@ -239,24 +197,13 @@ impl VideoConfig {
         }
     }
 
-    #[allow(dead_code)]
     pub const fn recommended_bitrate_for(
         resolution: Resolution,
         fps: FrameRate,
         quality: QualityPreset,
     ) -> u32 {
-        Self::recommended_bitrate_for_codec(resolution, fps, quality, VideoCodec::H264)
-    }
-
-    pub const fn recommended_bitrate_for_codec(
-        resolution: Resolution,
-        fps: FrameRate,
-        quality: QualityPreset,
-        codec: VideoCodec,
-    ) -> u32 {
         let base = Self::recommended_bitrate(resolution, fps) as u64;
-        let scaled = (base * quality.bitrate_scale_pct() as u64) / 100;
-        ((scaled * codec.bitrate_scale_pct() as u64) / 100) as u32
+        ((base * quality.bitrate_scale_pct() as u64) / 100) as u32
     }
 
     /// Calidad objetivo QVBR (escala 0..=100 de `CODECAPI_AVEncCommonQuality`).
@@ -349,7 +296,7 @@ impl Default for AudioConfig {
 pub enum CaptureMode {
     /// Inicia el Replay Buffer automáticamente al abrir un juego y lo pausa al cerrarlo (0% GPU en escritorio).
     AutoDetectGames,
-    /// El usuario decide cuándo activar/pausar el Replay Buffer sobre el monitor principal ("Play / Pausa").
+    /// Graba automáticamente y de forma continua el monitor seleccionado (pausable manualmente con F5 / bandeja).
     ManualMonitor,
 }
 
@@ -407,12 +354,14 @@ pub struct AppConfig {
     pub resolution: Resolution,
     pub fps: FrameRate,
     pub quality: QualityPreset,
-    pub video_codec: VideoCodec,
     pub encoder_pref: EncoderPreference,
     pub replay_duration: ReplayDuration,
     /// Atajo global para guardar los últimos N segundos (por defecto `\`).
     pub save_clip_hotkey: String,
     pub capture_mode: CaptureMode,
+    /// Nombre de dispositivo Windows del monitor seleccionado en modo Monitor (ej. `\\.\DISPLAY1`).
+    /// `None` selecciona automáticamente el monitor principal.
+    pub selected_monitor: Option<String>,
     pub audio_capture_mode: AudioCaptureMode,
     pub mic_enabled: bool,
     pub game_volume: f32,
@@ -438,11 +387,11 @@ impl Default for AppConfig {
             resolution: Resolution::P1080,
             fps: FrameRate::Fps60,
             quality: QualityPreset::Balanced,
-            video_codec: VideoCodec::H264,
             encoder_pref: EncoderPreference::AutoGpu,
             replay_duration: ReplayDuration::Sec30,
             save_clip_hotkey: "\\".to_string(),
             capture_mode: CaptureMode::AutoDetectGames,
+            selected_monitor: None,
             audio_capture_mode: AudioCaptureMode::FullDesktop,
             mic_enabled: true,
             game_volume: 1.0,
@@ -465,7 +414,6 @@ impl AppConfig {
             self.resolution,
             self.fps,
             self.quality,
-            self.video_codec,
             self.encoder_pref,
         )
     }
@@ -530,5 +478,24 @@ fn default_clips_dir() -> PathBuf {
         PathBuf::from(profile).join("Videos").join("Bals")
     } else {
         PathBuf::from("clips")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_legacy_config_with_removed_video_codec_field() {
+        let legacy_toml = r#"
+            resolution = "P1080"
+            fps = "Fps60"
+            quality = "Balanced"
+            video_codec = "Hevc"
+            capture_mode = "ManualMonitor"
+        "#;
+        let cfg: AppConfig = toml::from_str(legacy_toml).expect("debería ignorar video_codec");
+        assert_eq!(cfg.capture_mode, CaptureMode::ManualMonitor);
+        assert_eq!(cfg.selected_monitor, None);
     }
 }

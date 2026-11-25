@@ -18,7 +18,7 @@ use windows::core::PCWSTR;
 
 use crate::audio::AudioPipeline;
 use crate::buffer::ReplayBuffer;
-use crate::capture::CaptureTarget;
+use crate::capture::{CaptureTarget, resolve_monitor_target};
 use crate::capture::wgc::WgcCapture;
 use crate::clock;
 use crate::config::{AppConfig, AudioCaptureMode, AudioSource, CaptureMode, VideoConfig};
@@ -55,7 +55,9 @@ pub enum EngineEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingState {
     Idle,
-    RecordingManual,
+    RecordingManual {
+        monitor_label: String,
+    },
     RecordingGame {
         exe_name: String,
         pid: u32,
@@ -200,7 +202,7 @@ impl ActiveSession {
     ) -> Result<Self> {
         let timer_guard = HighResTimerGuard::new();
         let d3d = SharedD3DDevice::new()?;
-        let mut video_config = cfg.video_config();
+        let video_config = cfg.video_config();
         let capture = WgcCapture::start(&d3d, target, cfg.capture_cursor)?;
         let (out_w, out_h) = video_config.resolution.dimensions();
 
@@ -213,12 +215,10 @@ impl ActiveSession {
             video_config.fps.as_u32(),
         )?;
         let encoder = H264Encoder::new(&d3d, video_config)?;
-        video_config.codec = encoder.active_codec;
         let encoder_label = encoder.hardware_label();
 
         let max_bytes = cfg.max_buffer_ram_mb.max(32) * 1024 * 1024;
-        let mut replay_buffer =
-            ReplayBuffer::new_for_codec(cfg.replay_duration.as_secs(), max_bytes, encoder.active_codec);
+        let mut replay_buffer = ReplayBuffer::new(cfg.replay_duration.as_secs(), max_bytes);
 
         let audio = match AudioPipeline::start(cfg.audio_config(audio_source)) {
             Ok(pipe) => {
@@ -475,7 +475,13 @@ fn engine_loop(
     let mut last_game_poll = Instant::now() - Duration::from_secs(10);
     let mut last_status_publish = Instant::now();
 
-    publish_telemetry(&session, &cfg, &telemetry);
+    // Si el usuario eligió grabar un monitor completo, iniciar la captura automáticamente al arrancar.
+    if cfg.capture_mode == CaptureMode::ManualMonitor {
+        start_manual_session(&cfg, &mut session);
+        publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
+    } else {
+        publish_telemetry(&session, &cfg, &telemetry);
+    }
 
     info!(
         mode = ?cfg.capture_mode,
@@ -569,9 +575,15 @@ fn engine_loop(
                     let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
                 }
                 EngineCommand::UpdateConfig(new_cfg) => {
-                    cfg = new_cfg;
-                    let _ = cfg.save();
-                    publish_telemetry(&session, &cfg, &telemetry);
+                    apply_config_update(
+                        &mut cfg,
+                        new_cfg,
+                        &mut session,
+                        &mut last_game_poll,
+                        &shared_status,
+                        &event_tx,
+                        &telemetry,
+                    );
                 }
             }
         }
@@ -598,15 +610,17 @@ fn apply_config_update(
     telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
 ) {
     // Los volúmenes se actualizan en caliente vía AtomicU32 sin reiniciar ni perder el ReplayBuffer.
+    let mode_changed = new_cfg.capture_mode != cfg.capture_mode;
+    let monitor_changed = new_cfg.selected_monitor != cfg.selected_monitor;
     let needs_restart = new_cfg.resolution != cfg.resolution
         || new_cfg.fps != cfg.fps
         || new_cfg.quality != cfg.quality
-        || new_cfg.video_codec != cfg.video_codec
         || new_cfg.encoder_pref != cfg.encoder_pref
         || new_cfg.replay_duration != cfg.replay_duration
         || new_cfg.audio_capture_mode != cfg.audio_capture_mode
         || new_cfg.mic_enabled != cfg.mic_enabled
-        || new_cfg.capture_cursor != cfg.capture_cursor;
+        || new_cfg.capture_cursor != cfg.capture_cursor
+        || (new_cfg.capture_mode == CaptureMode::ManualMonitor && monitor_changed);
 
     let volumes_changed = (new_cfg.game_volume - cfg.game_volume).abs() > 0.001
         || (new_cfg.mic_volume - cfg.mic_volume).abs() > 0.001;
@@ -617,11 +631,22 @@ fn apply_config_update(
         warn!("Error guardando config.toml: {err:#}");
     }
 
-    if needs_restart {
+    if mode_changed {
+        *session = None;
+        match cfg.capture_mode {
+            CaptureMode::ManualMonitor => {
+                start_manual_session(cfg, session);
+            }
+            CaptureMode::AutoDetectGames => {
+                *last_game_poll = Instant::now() - Duration::from_secs(10);
+            }
+        }
+        publish_status(session, cfg, shared_status, event_tx, telemetry);
+    } else if needs_restart {
         if let Some(prev) = prev_state {
             *session = None;
             match prev {
-                RecordingState::RecordingManual => {
+                RecordingState::RecordingManual { .. } => {
                     start_manual_session(cfg, session);
                 }
                 RecordingState::RecordingGame { .. } => {
@@ -629,6 +654,9 @@ fn apply_config_update(
                 }
                 RecordingState::Idle => {}
             }
+            publish_status(session, cfg, shared_status, event_tx, telemetry);
+        } else if cfg.capture_mode == CaptureMode::ManualMonitor && monitor_changed {
+            start_manual_session(cfg, session);
             publish_status(session, cfg, shared_status, event_tx, telemetry);
         }
     } else if volumes_changed {
@@ -650,24 +678,24 @@ fn apply_config_update(
 
 fn start_manual_session(cfg: &AppConfig, session: &mut Option<ActiveSession>) {
     *session = None;
-    match ActiveSession::start(
-        cfg,
-        CaptureTarget::PrimaryMonitor,
-        AudioSource::SystemLoopback,
-        RecordingState::RecordingManual,
-    ) {
+    let (target, monitor_label) = resolve_monitor_target(cfg.selected_monitor.as_deref());
+    let state = RecordingState::RecordingManual {
+        monitor_label: monitor_label.clone(),
+    };
+    match ActiveSession::start(cfg, target, AudioSource::SystemLoopback, state) {
         Ok(active) => {
             info!(
+                monitor = %monitor_label,
                 resolution = %cfg.resolution,
                 fps = %cfg.fps,
                 replay = %cfg.replay_duration,
                 encoder = %active.encoder_label,
-                "Replay Buffer manual CFR iniciado (monitor principal)"
+                "Replay Buffer CFR iniciado sobre monitor seleccionado"
             );
             *session = Some(active);
         }
         Err(err) => {
-            error!("No se pudo iniciar la grabación manual: {err:#}");
+            error!("No se pudo iniciar la grabación del monitor ({monitor_label}): {err:#}");
         }
     }
 }
@@ -681,7 +709,7 @@ fn poll_game_autodetect(
 ) {
     if let Some(active) = session.as_ref() {
         match &active.state {
-            RecordingState::RecordingManual => return,
+            RecordingState::RecordingManual { .. } => return,
             RecordingState::RecordingGame { pid, exe_name, .. } => {
                 if is_process_alive(*pid) {
                     return;
@@ -827,7 +855,9 @@ fn handle_save_clip(
 fn recording_state_to_telemetry(state: &RecordingState) -> (TelemetryState, &str) {
     match state {
         RecordingState::Idle => (TelemetryState::Idle, ""),
-        RecordingState::RecordingManual => (TelemetryState::RecordingManual, "MONITOR"),
+        RecordingState::RecordingManual { monitor_label } => {
+            (TelemetryState::RecordingManual, monitor_label.as_str())
+        }
         RecordingState::RecordingGame {
             exe_name,
             paused_alt_tab,

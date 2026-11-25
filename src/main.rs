@@ -33,7 +33,7 @@ use crate::capture::CaptureTarget;
 use crate::capture::wgc::WgcCapture;
 use crate::config::{
     AppConfig, AudioConfig, AudioSource, EncoderPreference, FrameRate, QualityPreset,
-    ReplayDuration, Resolution, VideoCodec, VideoConfig,
+    ReplayDuration, Resolution, VideoConfig,
 };
 use crate::d3d::SharedD3DDevice;
 use crate::encode::h264_mft::H264Encoder;
@@ -134,17 +134,10 @@ fn run_cli_test(test_args: &[String]) -> Result<()> {
         .find(|w| w[0] == "--pid")
         .and_then(|w| w[1].parse::<u32>().ok());
 
-    let use_hevc = test_args.iter().any(|s| s.eq_ignore_ascii_case("--hevc"));
-    let codec = if use_hevc {
-        VideoCodec::Hevc
-    } else {
-        VideoCodec::H264
-    };
     let video_config = VideoConfig::preset_full(
         resolution,
         fps,
         QualityPreset::Balanced,
-        codec,
         EncoderPreference::AutoGpu,
     );
     let audio_config = AudioConfig {
@@ -186,12 +179,9 @@ fn run_av_clip_test(
         out_h,
         video_config.fps.as_u32(),
     )?;
-    let mut video_config = video_config;
     let mut encoder = H264Encoder::new(&d3d, video_config)?;
-    video_config.codec = encoder.active_codec;
 
-    let mut replay_buffer =
-        ReplayBuffer::new_for_codec(replay_duration.as_secs(), 128 * 1024 * 1024, encoder.active_codec);
+    let mut replay_buffer = ReplayBuffer::new(replay_duration.as_secs(), 128 * 1024 * 1024);
 
     let mut audio_pipeline = match AudioPipeline::start(audio_config) {
         Ok(pipe) => {

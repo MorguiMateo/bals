@@ -301,8 +301,8 @@ fn process_engine_events() {
                             "Bals — En espera (tecla: {})",
                             st.cfg.save_clip_hotkey
                         ),
-                        RecordingState::RecordingManual => format!(
-                            "Bals — Grabando monitor ({} {} | tecla: {})",
+                        RecordingState::RecordingManual { monitor_label } => format!(
+                            "Bals — Grabando {monitor_label} ({} {} | tecla: {})",
                             st.cfg.resolution, st.cfg.fps, st.cfg.save_clip_hotkey
                         ),
                         RecordingState::RecordingGame {
@@ -453,8 +453,8 @@ fn show_context_menu(hwnd: HWND) {
 
             let header = match &status.state {
                 RecordingState::Idle => "Bals — En espera (0% GPU)".to_string(),
-                RecordingState::RecordingManual => format!(
-                    "● Grabando monitor ({:.0}s · {:.1} MB RAM)",
+                RecordingState::RecordingManual { monitor_label } => format!(
+                    "● Grabando {monitor_label} ({:.0}s · {:.1} MB RAM)",
                     status.buffered_secs, status.buffer_ram_mb
                 ),
                 RecordingState::RecordingGame {
@@ -512,7 +512,7 @@ fn show_context_menu(hwnd: HWND) {
                 menu,
                 auto_flag,
                 IDM_TOGGLE_AUTODETECT,
-                "Detectar juegos automáticamente",
+                "Detectar juegos automáticamente (si no, grabar monitor)",
             );
 
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
