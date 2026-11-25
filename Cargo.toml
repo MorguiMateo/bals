@@ -1,6 +1,6 @@
 [package]
 name = "bals"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Bals — Lightweight Windows game clipper built in Rust with zero-copy GPU capture and hardware encoding"
 
@@ -38,6 +38,7 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Performance",
     "Win32_System_Registry",

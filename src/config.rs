@@ -256,6 +256,44 @@ pub enum AudioCaptureMode {
     FullDesktop,
 }
 
+/// Tema retro seleccionable para la interfaz de consola CRT de Bals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UiTheme {
+    /// Paleta oficial inspirada en el logo de Bals: carcasa crema retro + CRT fósforo verde.
+    #[default]
+    CrtPhosphorGreen,
+    /// Monitor monocromático ámbar clásico de los 80s.
+    CrtAmber80s,
+    /// Consola clásica gris con acentos rojo/índigo estilo SNES/Famicom.
+    ClassicConsole,
+    /// Gabinete arcade negro con fósforo cian/esmeralda neón.
+    ArcadeNeon,
+}
+
+impl UiTheme {
+    pub const ALL: [UiTheme; 4] = [
+        UiTheme::CrtPhosphorGreen,
+        UiTheme::CrtAmber80s,
+        UiTheme::ClassicConsole,
+        UiTheme::ArcadeNeon,
+    ];
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            UiTheme::CrtPhosphorGreen => "VERDE",
+            UiTheme::CrtAmber80s => "ÁMBAR",
+            UiTheme::ClassicConsole => "CONSOLA",
+            UiTheme::ArcadeNeon => "ARCADE",
+        }
+    }
+}
+
+impl fmt::Display for UiTheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.short_label())
+    }
+}
+
 /// Configuración persistente de Bals guardada en `%APPDATA%\Bals\config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -275,6 +313,10 @@ pub struct AppConfig {
     pub sound_feedback: bool,
     /// Comprobar e instalar automáticamente nuevas versiones desde GitHub Releases al iniciar.
     pub auto_update: bool,
+    /// Tema visual retro de la interfaz.
+    pub ui_theme: UiTheme,
+    /// Activar efecto sutil de líneas de barrido CRT en la pantalla interior.
+    pub crt_scanlines: bool,
     /// Tope de seguridad de RAM para el buffer circular en MB (protege PCs con poca RAM).
     pub max_buffer_ram_mb: usize,
     pub clips_dir: PathBuf,
@@ -298,6 +340,8 @@ impl Default for AppConfig {
             capture_cursor: true,
             sound_feedback: true,
             auto_update: true,
+            ui_theme: UiTheme::CrtPhosphorGreen,
+            crt_scanlines: true,
             max_buffer_ram_mb: 160,
             clips_dir: default_clips_dir(),
             extra_game_exes: Vec::new(),

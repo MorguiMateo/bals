@@ -16,6 +16,7 @@ use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 pub struct AudioLevelMonitor {
     desktop_peak: Arc<AtomicU32>,
     mic_peak: Arc<AtomicU32>,
+    paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     desktop_handle: Option<JoinHandle<()>>,
     mic_handle: Option<JoinHandle<()>>,
@@ -25,29 +26,38 @@ impl AudioLevelMonitor {
     pub fn start() -> Self {
         let desktop_peak = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let mic_peak = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let paused = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
 
         let d_peak = Arc::clone(&desktop_peak);
+        let d_paused = Arc::clone(&paused);
         let d_stop = Arc::clone(&stop);
         let desktop_handle = thread::Builder::new()
             .name("bals-vu-desktop".to_string())
-            .spawn(move || monitor_loop(Direction::Render, d_peak, d_stop))
+            .spawn(move || monitor_loop(Direction::Render, d_peak, d_paused, d_stop))
             .ok();
 
         let m_peak = Arc::clone(&mic_peak);
+        let m_paused = Arc::clone(&paused);
         let m_stop = Arc::clone(&stop);
         let mic_handle = thread::Builder::new()
             .name("bals-vu-mic".to_string())
-            .spawn(move || monitor_loop(Direction::Capture, m_peak, m_stop))
+            .spawn(move || monitor_loop(Direction::Capture, m_peak, m_paused, m_stop))
             .ok();
 
         Self {
             desktop_peak,
             mic_peak,
+            paused,
             stop,
             desktop_handle,
             mic_handle,
         }
+    }
+
+    /// Reduce cadencia de lectura cuando la ventana no está enfocada o no requiere refresco fino.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
     }
 
     /// Nivel instantáneo suavizado del audio de escritorio/juego (`0.0..=1.0`).
@@ -73,7 +83,12 @@ impl Drop for AudioLevelMonitor {
     }
 }
 
-fn monitor_loop(device_dir: Direction, level_out: Arc<AtomicU32>, stop: Arc<AtomicBool>) {
+fn monitor_loop(
+    device_dir: Direction,
+    level_out: Arc<AtomicU32>,
+    paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
     let _ = wasapi::initialize_mta();
 
     let Ok(enumerator) = DeviceEnumerator::new() else {
@@ -113,7 +128,8 @@ fn monitor_loop(device_dir: Direction, level_out: Arc<AtomicU32>, stop: Arc<Atom
     let mut smoothed = 0.0f32;
 
     while !stop.load(Ordering::Relaxed) {
-        let _ = h_event.wait_for_event(30);
+        let wait_ms = if paused.load(Ordering::Relaxed) { 120 } else { 30 };
+        let _ = h_event.wait_for_event(wait_ms);
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -130,15 +146,16 @@ fn monitor_loop(device_dir: Direction, level_out: Arc<AtomicU32>, stop: Arc<Atom
             if capture.read_from_device_to_deque(&mut raw).is_err() {
                 break;
             }
-            while raw.len() >= 4 {
-                let b0 = raw.pop_front().unwrap();
-                let b1 = raw.pop_front().unwrap();
-                let b2 = raw.pop_front().unwrap();
-                let b3 = raw.pop_front().unwrap();
-                let v = f32::from_le_bytes([b0, b1, b2, b3]).abs();
-                if v > chunk_peak {
-                    chunk_peak = v;
+            let complete_bytes = raw.len() & !3;
+            if complete_bytes > 0 {
+                let slice = raw.make_contiguous();
+                for c in slice[..complete_bytes].chunks_exact(4) {
+                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs();
+                    if v > chunk_peak {
+                        chunk_peak = v;
+                    }
                 }
+                raw.drain(..complete_bytes);
             }
         }
 

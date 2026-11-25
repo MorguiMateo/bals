@@ -6,11 +6,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{debug, error, info, warn};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible};
+use windows::core::PCWSTR;
 
 use crate::audio::AudioPipeline;
 use crate::buffer::ReplayBuffer;
@@ -22,7 +26,11 @@ use crate::d3d::SharedD3DDevice;
 use crate::encode::h264_mft::H264Encoder;
 use crate::encode::video_processor::GpuNv12Converter;
 use crate::game_detect::{DetectedGame, detect_foreground_game, is_process_alive};
+use crate::ipc::{TelemetryState, TelemetryWriter};
 use crate::muxer::{WriteStats, generate_clip_path, write_mp4_clip};
+
+const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG: u32 = 0x0000_0002;
+const TIMER_ACCESS_SYNC_MODIFY: u32 = 0x0010_0002; // SYNCHRONIZE | TIMER_MODIFY_STATE
 
 /// Comandos que la bandeja del sistema, hotkeys o GUI envían al motor de grabación.
 #[derive(Debug, Clone)]
@@ -74,8 +82,7 @@ impl Default for EngineStatus {
     }
 }
 
-/// Activa resolución de temporizador de 1 ms en Windows solo mientras se graba
-/// (garantiza un ritmo constante de 60.000 / 30.000 FPS sin micro-tirones).
+/// Activa resolución de temporizador de 1 ms en Windows solo mientras se graba.
 struct HighResTimerGuard;
 
 impl HighResTimerGuard {
@@ -95,16 +102,74 @@ impl Drop for HighResTimerGuard {
     }
 }
 
+/// Temporizador de espera de alta resolución de Windows 10/11 (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`).
+/// Permite dormir con precisión de ~0.5 ms a 0% CPU en lugar de hacer spin-yield durante 1.5 ms/frame.
+struct HighResWaitTimer {
+    handle: Option<HANDLE>,
+}
+
+impl HighResWaitTimer {
+    fn new() -> Self {
+        let handle = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_FLAG,
+                TIMER_ACCESS_SYNC_MODIFY,
+            )
+            .or_else(|_| {
+                CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ACCESS_SYNC_MODIFY)
+            })
+            .ok()
+        };
+        Self { handle }
+    }
+
+    /// Duerme dejando un margen mínimo (~0.25 ms) para el ajuste final de exactitud CFR.
+    fn sleep_until_near(&self, remaining_100ns: i64) {
+        if let Some(handle) = self.handle {
+            // Dejar 0.25 ms (2500 ticks de 100 ns) para el yield fino final.
+            let wait_100ns = (remaining_100ns - 2_500).clamp(1_000, 100_000);
+            let due_time = -wait_100ns;
+            if unsafe { SetWaitableTimer(handle, &due_time, 0, None, None, false) }.is_ok() {
+                unsafe {
+                    WaitForSingleObject(handle, 30);
+                }
+                return;
+            }
+        }
+        // Fallback clásico si no hay waitable timer disponible.
+        if remaining_100ns > 15_000 {
+            let sleep_ms = ((remaining_100ns - 10_000) / 10_000).clamp(1, 8) as u64;
+            thread::sleep(Duration::from_millis(sleep_ms));
+        } else {
+            thread::yield_now();
+        }
+    }
+}
+
+impl Drop for HighResWaitTimer {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
 /// Sesión activa de grabación en Replay Buffer a tasa de cuadros constante (CFR).
 ///
-/// Solo existe mientras se graba; al cerrarse se liberan GPU, audio y el timer de 1 ms (0% GPU).
-/// Soporta pausa transparente en Alt-Tab sin perder ni sobrescribir el `ReplayBuffer` en RAM.
+/// Posee su propio `SharedD3DDevice` creado bajo demanda; al cerrarse se liberan D3D11/VRAM,
+/// audio y el timer de 1 ms (verdadero 0% GPU y 0 MB VRAM en escritorio).
 struct ActiveSession {
+    d3d: SharedD3DDevice,
     capture: Option<WgcCapture>,
     capture_cursor: bool,
     target_hwnd: Option<HWND>,
     converter: GpuNv12Converter,
     encoder: H264Encoder,
+    encoder_label: String,
     audio: Option<AudioPipeline>,
     replay_buffer: ReplayBuffer,
     video_config: VideoConfig,
@@ -122,31 +187,33 @@ struct ActiveSession {
     /// si el juego/escritorio no presentó un frame nuevo en el tick actual).
     last_nv12: Option<ID3D11Texture2D>,
     state: RecordingState,
+    wait_timer: HighResWaitTimer,
     _timer_guard: HighResTimerGuard,
 }
 
 impl ActiveSession {
     fn start(
-        d3d: &SharedD3DDevice,
         cfg: &AppConfig,
         target: CaptureTarget,
         audio_source: AudioSource,
         state: RecordingState,
     ) -> Result<Self> {
         let timer_guard = HighResTimerGuard::new();
+        let d3d = SharedD3DDevice::new()?;
         let video_config = cfg.video_config();
-        let capture = WgcCapture::start(d3d, target, cfg.capture_cursor)?;
+        let capture = WgcCapture::start(&d3d, target, cfg.capture_cursor)?;
         let (out_w, out_h) = video_config.resolution.dimensions();
 
         let converter = GpuNv12Converter::new(
-            d3d,
+            &d3d,
             capture.initial_size.Width as u32,
             capture.initial_size.Height as u32,
             out_w,
             out_h,
             video_config.fps.as_u32(),
         )?;
-        let encoder = H264Encoder::new(d3d, video_config)?;
+        let encoder = H264Encoder::new(&d3d, video_config)?;
+        let encoder_label = encoder.hardware_label();
 
         let max_bytes = cfg.max_buffer_ram_mb.max(32) * 1024 * 1024;
         let mut replay_buffer = ReplayBuffer::new(cfg.replay_duration.as_secs(), max_bytes);
@@ -183,11 +250,13 @@ impl ActiveSession {
         };
 
         Ok(Self {
+            d3d,
             capture: Some(capture),
             capture_cursor: cfg.capture_cursor,
             target_hwnd,
             converter,
             encoder,
+            encoder_label,
             audio,
             replay_buffer,
             video_config,
@@ -198,6 +267,7 @@ impl ActiveSession {
             frame_index: 0,
             last_nv12: None,
             state,
+            wait_timer: HighResWaitTimer::new(),
             _timer_guard: timer_guard,
         })
     }
@@ -208,7 +278,7 @@ impl ActiveSession {
 
     /// Evalúa si el juego está minimizado o en Alt-Tab sin frames activos.
     /// Devuelve `true` si cambió el estado de pausa (para refrescar la bandeja).
-    fn update_alt_tab_pause(&mut self, d3d: &SharedD3DDevice) -> bool {
+    fn update_alt_tab_pause(&mut self) -> bool {
         let Some(hwnd) = self.target_hwnd else {
             return false;
         };
@@ -238,7 +308,9 @@ impl ActiveSession {
             // Si WGC se había soltado durante el Alt-Tab (ej. fullscreen exclusivo), re-engancharlo
             // manteniendo intacto todo el ReplayBuffer.
             if self.capture.is_none() {
-                if let Ok(new_cap) = WgcCapture::start(d3d, CaptureTarget::Window(hwnd), self.capture_cursor) {
+                if let Ok(new_cap) =
+                    WgcCapture::start(&self.d3d, CaptureTarget::Window(hwnd), self.capture_cursor)
+                {
                     self.capture = Some(new_cap);
                 } else {
                     return false;
@@ -263,8 +335,6 @@ impl ActiveSession {
     fn pump_audio(&mut self) {
         if let Some(audio) = &self.audio {
             while let Ok(mut apkt) = audio.rx.try_recv() {
-                // Mientras está en pausa por Alt-Tab, descartamos audio nuevo para conservar
-                // intacto el audio de la jugada previa en el ReplayBuffer.
                 if self.is_paused() {
                     continue;
                 }
@@ -274,21 +344,19 @@ impl ActiveSession {
         }
     }
 
-    /// Espera con precisión de sub-milisegundo hasta el siguiente tick CFR (60.000 / 30.000 FPS)
-    /// y codifica el frame más reciente de la GPU (o reutiliza el último NV12 si la imagen no cambió).
-    fn step_cfr_tick(&mut self, d3d: &SharedD3DDevice) -> Result<bool> {
-        let pause_changed = self.update_alt_tab_pause(d3d);
+    /// Espera con precisión de sub-milisegundo sin busy-spin hasta el siguiente tick CFR
+    /// y codifica el frame más reciente de la GPU (o reutiliza el último NV12 si no cambió).
+    fn step_cfr_tick(&mut self) -> Result<bool> {
+        let pause_changed = self.update_alt_tab_pause();
 
-        // Si está pausado por Alt-Tab, dormimos livianamente (0% GPU) sin tocar el ReplayBuffer.
         if self.is_paused() {
-            // Revisar si WGC recibió un frame nuevo (p. ej. juego en segundo monitor volvió a renderizar).
             if let Some(cap) = &self.capture {
                 if let Some(fresh) = cap.take_latest() {
                     self.last_wgc_frame_at = Instant::now();
                     if let Ok(nv12) = self.converter.convert(&fresh.texture, fresh.width, fresh.height) {
                         self.last_nv12 = Some(nv12);
                     }
-                    return Ok(self.update_alt_tab_pause(d3d) || pause_changed);
+                    return Ok(self.update_alt_tab_pause() || pause_changed);
                 }
             }
             thread::sleep(Duration::from_millis(50));
@@ -299,7 +367,7 @@ impl ActiveSession {
         let target_rel_100ns = (self.frame_index as i64 * 10_000_000) / fps;
         let target_wall_qpc = self.qpc_origin_100ns + self.total_paused_100ns + target_rel_100ns;
 
-        // Espera híbrida: sleep de 1 ms mientras falte >1.5 ms, luego yield fino para exactitud CFR.
+        // Espera con HighResWaitTimer (0% CPU) hasta faltando ~0.25 ms, luego yield fino.
         loop {
             let now = clock::now_100ns();
             let remaining = target_wall_qpc - now;
@@ -310,9 +378,8 @@ impl ActiveSession {
                 }
                 break;
             }
-            if remaining > 15_000 {
-                let sleep_ms = ((remaining - 10_000) / 10_000).clamp(1, 8) as u64;
-                thread::sleep(Duration::from_millis(sleep_ms));
+            if remaining > 4_000 {
+                self.wait_timer.sleep_until_near(remaining);
             } else {
                 thread::yield_now();
             }
@@ -325,8 +392,6 @@ impl ActiveSession {
                 match self.converter.convert(&fresh.texture, fresh.width, fresh.height) {
                     Ok(nv12) => self.last_nv12 = Some(nv12),
                     Err(err) => {
-                        // Error transitorio durante cambio de modo fullscreen/Alt-Tab:
-                        // no descartamos el ReplayBuffer; soltamos solo WGC para re-engancharlo.
                         warn!("Conversión transitoria falló durante transición de ventana ({err:#}); preservando ReplayBuffer");
                         self.capture = None;
                         self.paused_since_100ns = Some(clock::now_100ns());
@@ -403,17 +468,12 @@ fn engine_loop(
     event_tx: Sender<EngineEvent>,
     shared_status: Arc<Mutex<EngineStatus>>,
 ) {
-    let d3d = match SharedD3DDevice::new() {
-        Ok(d) => d,
-        Err(err) => {
-            error!("No se pudo inicializar D3D11 en bals-engine: {err:#}");
-            return;
-        }
-    };
-
+    let telemetry = Arc::new(Mutex::new(TelemetryWriter::create()));
     let mut session: Option<ActiveSession> = None;
     let mut last_game_poll = Instant::now() - Duration::from_secs(10);
     let mut last_status_publish = Instant::now();
+
+    publish_telemetry(&session, &cfg, &telemetry);
 
     info!(
         mode = ?cfg.capture_mode,
@@ -421,7 +481,7 @@ fn engine_loop(
         fps = %cfg.fps,
         replay = %cfg.replay_duration,
         hotkey = %cfg.save_clip_hotkey,
-        "Motor CFR de Bals listo en segundo plano"
+        "Motor CFR de Bals listo en segundo plano (D3D11 lazy: 0% GPU / 0 MB VRAM en espera)"
     );
 
     loop {
@@ -434,59 +494,37 @@ fn engine_loop(
                     break;
                 }
                 EngineCommand::StartManual => {
-                    start_manual_session(&d3d, &cfg, &mut session);
-                    publish_status(&session, &shared_status, &event_tx);
+                    start_manual_session(&cfg, &mut session);
+                    publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
                 EngineCommand::Stop => {
                     if session.take().is_some() {
-                        info!("Grabación detenida (GPU en reposo 0%)");
-                        publish_status(&session, &shared_status, &event_tx);
+                        info!("Grabación detenida (GPU y VRAM liberadas al 100%)");
+                        publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                     }
                 }
                 EngineCommand::ToggleManual => {
                     if session.is_some() {
                         session = None;
-                        info!("Grabación pausada manualmente");
+                        info!("Grabación pausada manualmente (GPU liberada)");
                     } else {
-                        start_manual_session(&d3d, &cfg, &mut session);
+                        start_manual_session(&cfg, &mut session);
                     }
-                    publish_status(&session, &shared_status, &event_tx);
+                    publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
                 EngineCommand::SaveClip => {
-                    handle_save_clip(&mut session, &cfg, &shared_status, &event_tx);
+                    handle_save_clip(&mut session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
                 EngineCommand::UpdateConfig(new_cfg) => {
-                    let needs_restart = new_cfg.resolution != cfg.resolution
-                        || new_cfg.fps != cfg.fps
-                        || new_cfg.quality != cfg.quality
-                        || new_cfg.replay_duration != cfg.replay_duration
-                        || new_cfg.audio_capture_mode != cfg.audio_capture_mode
-                        || new_cfg.mic_enabled != cfg.mic_enabled
-                        || new_cfg.capture_cursor != cfg.capture_cursor
-                        || (new_cfg.game_volume - cfg.game_volume).abs() > 0.001
-                        || (new_cfg.mic_volume - cfg.mic_volume).abs() > 0.001;
-
-                    let prev_state = session.as_ref().map(|s| s.state.clone());
-                    cfg = new_cfg;
-                    if let Err(err) = cfg.save() {
-                        warn!("Error guardando config.toml: {err:#}");
-                    }
-
-                    if needs_restart {
-                        if let Some(prev) = prev_state {
-                            session = None;
-                            match prev {
-                                RecordingState::RecordingManual => {
-                                    start_manual_session(&d3d, &cfg, &mut session);
-                                }
-                                RecordingState::RecordingGame { .. } => {
-                                    last_game_poll = Instant::now() - Duration::from_secs(10);
-                                }
-                                RecordingState::Idle => {}
-                            }
-                            publish_status(&session, &shared_status, &event_tx);
-                        }
-                    }
+                    apply_config_update(
+                        &mut cfg,
+                        new_cfg,
+                        &mut session,
+                        &mut last_game_poll,
+                        &shared_status,
+                        &event_tx,
+                        &telemetry,
+                    );
                 }
             }
         }
@@ -500,46 +538,47 @@ fn engine_loop(
             && last_game_poll.elapsed() >= Duration::from_secs(2)
         {
             last_game_poll = Instant::now();
-            poll_game_autodetect(&d3d, &cfg, &mut session, &shared_status, &event_tx);
+            poll_game_autodetect(&cfg, &mut session, &shared_status, &event_tx, &telemetry);
         }
 
         // 3. Ejecutar el siguiente tick CFR exacto si hay sesión activa, o dormir si estamos en reposo.
         if let Some(active) = session.as_mut() {
             active.pump_audio();
-            match active.step_cfr_tick(&d3d) {
-                Ok(true) => publish_status(&session, &shared_status, &event_tx),
+            match active.step_cfr_tick() {
+                Ok(true) => publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry),
                 Ok(false) => {}
                 Err(err) => {
                     warn!("La sesión de captura se cerró ({err:#}); pasando a reposo");
                     session = None;
-                    publish_status(&session, &shared_status, &event_tx);
+                    publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
             }
         } else if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(200)) {
             match cmd {
                 EngineCommand::Shutdown => break,
                 EngineCommand::StartManual | EngineCommand::ToggleManual => {
-                    start_manual_session(&d3d, &cfg, &mut session);
-                    publish_status(&session, &shared_status, &event_tx);
+                    start_manual_session(&cfg, &mut session);
+                    publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
                 EngineCommand::Stop => {}
                 EngineCommand::SaveClip => {
-                    let _ = event_tx.send(EngineEvent::ClipFailed(
-                        "No hay ninguna grabación activa. Inicia un juego o activa el modo manual."
-                            .to_string(),
-                    ));
+                    let msg = "No hay grabación activa. Inicia un juego o activa el modo manual.";
+                    record_and_publish_event(&session, &cfg, &telemetry, msg, true);
+                    let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
                 }
                 EngineCommand::UpdateConfig(new_cfg) => {
                     cfg = new_cfg;
                     let _ = cfg.save();
+                    publish_telemetry(&session, &cfg, &telemetry);
                 }
             }
         }
 
-        // 4. Actualizar telemetría (segundos en buffer y RAM usada) cada ~1 s.
-        if last_status_publish.elapsed() >= Duration::from_secs(1) {
+        // 4. Actualizar telemetría (segundos en buffer y RAM usada) cada ~500 ms.
+        if last_status_publish.elapsed() >= Duration::from_millis(500) {
             last_status_publish = Instant::now();
             update_shared_metrics(&session, &shared_status);
+            publish_telemetry(&session, &cfg, &telemetry);
         }
     }
 
@@ -547,14 +586,67 @@ fn engine_loop(
     info!("Motor de Bals apagado limpiamente");
 }
 
-fn start_manual_session(
-    d3d: &SharedD3DDevice,
-    cfg: &AppConfig,
+fn apply_config_update(
+    cfg: &mut AppConfig,
+    new_cfg: AppConfig,
     session: &mut Option<ActiveSession>,
+    last_game_poll: &mut Instant,
+    shared_status: &Arc<Mutex<EngineStatus>>,
+    event_tx: &Sender<EngineEvent>,
+    telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
 ) {
+    // Los volúmenes se actualizan en caliente vía AtomicU32 sin reiniciar ni perder el ReplayBuffer.
+    let needs_restart = new_cfg.resolution != cfg.resolution
+        || new_cfg.fps != cfg.fps
+        || new_cfg.quality != cfg.quality
+        || new_cfg.replay_duration != cfg.replay_duration
+        || new_cfg.audio_capture_mode != cfg.audio_capture_mode
+        || new_cfg.mic_enabled != cfg.mic_enabled
+        || new_cfg.capture_cursor != cfg.capture_cursor;
+
+    let volumes_changed = (new_cfg.game_volume - cfg.game_volume).abs() > 0.001
+        || (new_cfg.mic_volume - cfg.mic_volume).abs() > 0.001;
+
+    let prev_state = session.as_ref().map(|s| s.state.clone());
+    *cfg = new_cfg;
+    if let Err(err) = cfg.save() {
+        warn!("Error guardando config.toml: {err:#}");
+    }
+
+    if needs_restart {
+        if let Some(prev) = prev_state {
+            *session = None;
+            match prev {
+                RecordingState::RecordingManual => {
+                    start_manual_session(cfg, session);
+                }
+                RecordingState::RecordingGame { .. } => {
+                    *last_game_poll = Instant::now() - Duration::from_secs(10);
+                }
+                RecordingState::Idle => {}
+            }
+            publish_status(session, cfg, shared_status, event_tx, telemetry);
+        }
+    } else if volumes_changed {
+        if let Some(active) = session.as_ref() {
+            if let Some(audio) = active.audio.as_ref() {
+                audio.set_volumes(cfg.game_volume, cfg.mic_volume);
+                info!(
+                    game_vol = format!("{:.0}%", cfg.game_volume * 100.0),
+                    mic_vol = format!("{:.0}%", cfg.mic_volume * 100.0),
+                    "Volúmenes actualizados en vivo sin interrumpir el Replay Buffer"
+                );
+            }
+        }
+        publish_telemetry(session, cfg, telemetry);
+    } else {
+        publish_telemetry(session, cfg, telemetry);
+    }
+}
+
+fn start_manual_session(cfg: &AppConfig, session: &mut Option<ActiveSession>) {
     *session = None;
     match ActiveSession::start(
-        d3d,
         cfg,
         CaptureTarget::PrimaryMonitor,
         AudioSource::SystemLoopback,
@@ -565,6 +657,7 @@ fn start_manual_session(
                 resolution = %cfg.resolution,
                 fps = %cfg.fps,
                 replay = %cfg.replay_duration,
+                encoder = %active.encoder_label,
                 "Replay Buffer manual CFR iniciado (monitor principal)"
             );
             *session = Some(active);
@@ -576,11 +669,11 @@ fn start_manual_session(
 }
 
 fn poll_game_autodetect(
-    d3d: &SharedD3DDevice,
     cfg: &AppConfig,
     session: &mut Option<ActiveSession>,
     shared_status: &Arc<Mutex<EngineStatus>>,
     event_tx: &Sender<EngineEvent>,
+    telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
 ) {
     if let Some(active) = session.as_ref() {
         match &active.state {
@@ -589,9 +682,9 @@ fn poll_game_autodetect(
                 if is_process_alive(*pid) {
                     return;
                 }
-                info!(game = %exe_name, pid, "El juego se cerró; pausando Replay Buffer (0% GPU)");
+                info!(game = %exe_name, pid, "El juego se cerró; liberando GPU/VRAM (0%)");
                 *session = None;
-                publish_status(session, shared_status, event_tx);
+                publish_status(session, cfg, shared_status, event_tx, telemetry);
             }
             RecordingState::Idle => {}
         }
@@ -621,10 +714,10 @@ fn poll_game_autodetect(
             pid,
             paused_alt_tab: false,
         };
-        match ActiveSession::start(d3d, cfg, CaptureTarget::Window(hwnd), audio_src, state) {
+        match ActiveSession::start(cfg, CaptureTarget::Window(hwnd), audio_src, state) {
             Ok(active) => {
                 *session = Some(active);
-                publish_status(session, shared_status, event_tx);
+                publish_status(session, cfg, shared_status, event_tx, telemetry);
             }
             Err(err) => {
                 warn!(game = %exe_name, "No se pudo enganchar ventana WGC ({err:#}); intentando monitor principal");
@@ -634,14 +727,13 @@ fn poll_game_autodetect(
                     paused_alt_tab: false,
                 };
                 if let Ok(active) = ActiveSession::start(
-                    d3d,
                     cfg,
                     CaptureTarget::PrimaryMonitor,
                     audio_src,
                     fallback_state,
                 ) {
                     *session = Some(active);
-                    publish_status(session, shared_status, event_tx);
+                    publish_status(session, cfg, shared_status, event_tx, telemetry);
                 }
             }
         }
@@ -653,23 +745,25 @@ fn handle_save_clip(
     cfg: &AppConfig,
     shared_status: &Arc<Mutex<EngineStatus>>,
     event_tx: &Sender<EngineEvent>,
+    telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
 ) {
     let Some(active) = session.as_mut() else {
-        let _ = event_tx.send(EngineEvent::ClipFailed(
-            "No hay grabación activa en este momento.".to_string(),
-        ));
+        let msg = "No hay grabación activa en este momento.";
+        record_and_publish_event(session, cfg, telemetry, msg, true);
+        let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
         return;
     };
 
     active.pump_audio();
 
+    // Snapshot Zero-Copy (Arc<[u8]>): ~0.05 ms y 0 MB de copia en el hilo de grabación.
     let Some(snapshot) = active
         .replay_buffer
         .snapshot(Some(cfg.replay_duration.as_secs()))
     else {
-        let _ = event_tx.send(EngineEvent::ClipFailed(
-            "El buffer aún no tiene suficiente video (espera 2 segundos).".to_string(),
-        ));
+        let msg = "El buffer aún no tiene suficiente video (espera 2 segundos).";
+        record_and_publish_event(session, cfg, telemetry, msg, true);
+        let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
         return;
     };
 
@@ -677,21 +771,120 @@ fn handle_save_clip(
     let video_config = active.video_config;
     let event_tx_clone = event_tx.clone();
     let status_clone = Arc::clone(shared_status);
+    let telemetry_clone = Arc::clone(telemetry);
+    let target_secs = cfg.replay_duration.as_secs();
+    let state_snap = active.state.clone();
+    let enc_snap = active.encoder_label.clone();
 
     let _ = thread::Builder::new()
         .name("bals-mp4-writer".to_string())
         .spawn(move || match write_mp4_clip(&clip_path, &snapshot, video_config) {
             Ok(stats) => {
-                if let Ok(mut guard) = status_clone.lock() {
+                let (buf_s, ram_mb) = if let Ok(mut guard) = status_clone.lock() {
                     guard.last_clip = Some(stats.path.clone());
+                    (guard.buffered_secs as f32, guard.buffer_ram_mb as f32)
+                } else {
+                    (0.0, 0.0)
+                };
+                let fname = stats
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "clip.mp4".to_string());
+                let msg = format!(
+                    "CLIP GUARDADO: {fname} ({:.1}s · {:.1} MB)",
+                    stats.clip_duration_secs,
+                    stats.file_bytes as f64 / (1024.0 * 1024.0)
+                );
+                if let Ok(mut guard) = telemetry_clone.lock() {
+                    if let Some(writer) = guard.as_mut() {
+                        writer.record_clip_event(&msg, false);
+                        let (tstate, gname) = recording_state_to_telemetry(&state_snap);
+                        writer.publish(tstate, target_secs, buf_s, ram_mb, gname, &enc_snap);
+                    }
                 }
                 let _ = event_tx_clone.send(EngineEvent::ClipSaved(stats));
             }
             Err(err) => {
                 error!("Error escribiendo clip MP4: {err:#}");
+                let err_msg = format!("Error guardando clip: {err:#}");
+                if let Ok(mut guard) = telemetry_clone.lock() {
+                    if let Some(writer) = guard.as_mut() {
+                        writer.record_clip_event(&err_msg, true);
+                        let (tstate, gname) = recording_state_to_telemetry(&state_snap);
+                        writer.publish(tstate, target_secs, 0.0, 0.0, gname, &enc_snap);
+                    }
+                }
                 let _ = event_tx_clone.send(EngineEvent::ClipFailed(format!("{err:#}")));
             }
         });
+}
+
+fn recording_state_to_telemetry(state: &RecordingState) -> (TelemetryState, &str) {
+    match state {
+        RecordingState::Idle => (TelemetryState::Idle, ""),
+        RecordingState::RecordingManual => (TelemetryState::RecordingManual, "MONITOR"),
+        RecordingState::RecordingGame {
+            exe_name,
+            paused_alt_tab,
+            ..
+        } => {
+            if *paused_alt_tab {
+                (TelemetryState::PausedAltTab, exe_name.as_str())
+            } else {
+                (TelemetryState::RecordingGame, exe_name.as_str())
+            }
+        }
+    }
+}
+
+fn record_and_publish_event(
+    session: &Option<ActiveSession>,
+    cfg: &AppConfig,
+    telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
+    msg: &str,
+    is_err: bool,
+) {
+    if let Ok(mut guard) = telemetry.lock() {
+        if let Some(writer) = guard.as_mut() {
+            writer.record_clip_event(msg, is_err);
+        }
+    }
+    publish_telemetry(session, cfg, telemetry);
+}
+
+fn publish_telemetry(
+    session: &Option<ActiveSession>,
+    cfg: &AppConfig,
+    telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
+) {
+    let Ok(mut guard) = telemetry.lock() else {
+        return;
+    };
+    let Some(writer) = guard.as_mut() else {
+        return;
+    };
+
+    if let Some(active) = session {
+        let (tstate, gname) = recording_state_to_telemetry(&active.state);
+        writer.publish(
+            tstate,
+            cfg.replay_duration.as_secs(),
+            active.replay_buffer.buffered_secs() as f32,
+            (active.replay_buffer.total_bytes() as f64 / (1024.0 * 1024.0)) as f32,
+            gname,
+            &active.encoder_label,
+        );
+    } else {
+        writer.publish(
+            TelemetryState::Idle,
+            cfg.replay_duration.as_secs(),
+            0.0,
+            0.0,
+            "",
+            "ZERO-COPY STANDBY",
+        );
+    }
 }
 
 fn update_shared_metrics(
@@ -713,10 +906,13 @@ fn update_shared_metrics(
 
 fn publish_status(
     session: &Option<ActiveSession>,
+    cfg: &AppConfig,
     shared_status: &Arc<Mutex<EngineStatus>>,
     event_tx: &Sender<EngineEvent>,
+    telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
 ) {
     update_shared_metrics(session, shared_status);
+    publish_telemetry(session, cfg, telemetry);
     if let Ok(guard) = shared_status.lock() {
         let _ = event_tx.send(EngineEvent::StatusChanged(guard.clone()));
     }

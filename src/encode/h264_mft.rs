@@ -1,4 +1,5 @@
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
@@ -48,6 +49,7 @@ pub struct H264Encoder {
     pub is_async: bool,
     mft_provides_output_samples: bool,
     output_buffer_size: u32,
+    reusable_out_sample: Option<IMFSample>,
     pending_input_requests: usize,
     frame_duration_100ns: i64,
     gop_duration_100ns: i64,
@@ -192,12 +194,30 @@ impl H264Encoder {
             is_async,
             mft_provides_output_samples,
             output_buffer_size,
+            reusable_out_sample: None,
             pending_input_requests: 0,
             frame_duration_100ns: config.fps.frame_duration_100ns(),
             gop_duration_100ns: config.gop_duration_100ns(),
             last_forced_kf_ts: None,
             mf_started: true,
         })
+    }
+
+    /// Etiqueta corta del encoder activo para mostrar en el HUD de la consola retro.
+    pub fn hardware_label(&self) -> String {
+        if !self.is_hardware {
+            return "CPU SW".to_string();
+        }
+        let lower = self.name.to_ascii_lowercase();
+        if lower.contains("nvidia") || lower.contains("nvenc") {
+            "NVENC HW".to_string()
+        } else if lower.contains("amd") || lower.contains("amf") || lower.contains("vce") {
+            "AMD AMF HW".to_string()
+        } else if lower.contains("intel") || lower.contains("qsv") {
+            "INTEL QSV HW".to_string()
+        } else {
+            "GPU HW".to_string()
+        }
     }
 
     /// Solicita explícitamente un Keyframe (IDR) al encoder para el próximo frame.
@@ -341,6 +361,11 @@ impl H264Encoder {
     fn pull_output_packet(&mut self) -> Result<Option<EncodedVideoPacket>> {
         let provided_sample = if self.mft_provides_output_samples {
             None
+        } else if let Some(cached) = self.reusable_out_sample.take() {
+            if let Ok(buf) = unsafe { cached.GetBufferByIndex(0) } {
+                let _ = unsafe { buf.SetCurrentLength(0) };
+            }
+            Some(cached)
         } else {
             let sample = unsafe { MFCreateSample() }.context("MFCreateSample (out) falló")?;
             let buffer = unsafe { MFCreateMemoryBuffer(self.output_buffer_size) }
@@ -365,8 +390,16 @@ impl H264Encoder {
 
         match hr {
             Ok(()) => {}
-            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                if !self.mft_provides_output_samples {
+                    self.reusable_out_sample = out_sample;
+                }
+                return Ok(None);
+            }
             Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                if !self.mft_provides_output_samples {
+                    self.reusable_out_sample = out_sample;
+                }
                 debug!("MFT reportó MF_E_TRANSFORM_STREAM_CHANGE; refrescando tipo de salida");
                 if let Ok(new_type) = unsafe { self.mft.GetOutputAvailableType(0, 0) } {
                     let _ = unsafe { self.mft.SetOutputType(0, &new_type, 0) };
@@ -392,14 +425,19 @@ impl H264Encoder {
         unsafe { buffer.Lock(&mut ptr, None, Some(&mut current_len)) }
             .context("IMFMediaBuffer::Lock falló")?;
 
-        let data = if !ptr.is_null() && current_len > 0 {
-            unsafe { std::slice::from_raw_parts(ptr, current_len as usize) }.to_vec()
+        let data: Arc<[u8]> = if !ptr.is_null() && current_len > 0 {
+            Arc::from(unsafe { std::slice::from_raw_parts(ptr, current_len as usize) })
         } else {
-            Vec::new()
+            Arc::from([])
         };
 
         unsafe {
             let _ = buffer.Unlock();
+        }
+        drop(buffer);
+
+        if !self.mft_provides_output_samples {
+            self.reusable_out_sample = Some(sample);
         }
 
         if data.is_empty() {

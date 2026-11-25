@@ -228,10 +228,10 @@ fn write_mp4_inner(
                         combined.extend_from_slice(&pkt.data);
                         std::borrow::Cow::Owned(combined)
                     } else {
-                        std::borrow::Cow::Borrowed(&pkt.data)
+                        std::borrow::Cow::Borrowed(pkt.data.as_ref())
                     }
                 } else {
-                    std::borrow::Cow::Borrowed(&pkt.data)
+                    std::borrow::Cow::Borrowed(pkt.data.as_ref())
                 };
 
             let sample = create_memory_sample(&payload, rel_pts, duration, pkt.is_keyframe)?;

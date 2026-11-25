@@ -124,6 +124,7 @@ fn capture_thread(
     }
 
     let mut raw_bytes: VecDeque<u8> = VecDeque::with_capacity(16 * 1024);
+    let mut scratch_samples: Vec<f32> = Vec::with_capacity(4096);
 
     while !stop.load(Ordering::Relaxed) {
         // Espera corta (25 ms) para reaccionar rápido al cierre incluso en silencio total.
@@ -149,16 +150,20 @@ fn capture_thread(
             }
         }
 
-        let complete_samples = raw_bytes.len() / 4;
-        if complete_samples > 0 {
+        let complete_bytes = raw_bytes.len() & !3;
+        if complete_bytes > 0 {
+            // Convertir muestras fuera del mutex haciendo contiguo el VecDeque en una operación O(1) amortizada.
+            let slice = raw_bytes.make_contiguous();
+            scratch_samples.clear();
+            scratch_samples.extend(
+                slice[..complete_bytes]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+            raw_bytes.drain(..complete_bytes);
+
             let mut guard = samples_out.lock().unwrap();
-            for _ in 0..complete_samples {
-                let b0 = raw_bytes.pop_front().unwrap();
-                let b1 = raw_bytes.pop_front().unwrap();
-                let b2 = raw_bytes.pop_front().unwrap();
-                let b3 = raw_bytes.pop_front().unwrap();
-                guard.push_back(f32::from_le_bytes([b0, b1, b2, b3]));
-            }
+            guard.extend(&scratch_samples);
             // Limitar la cola para evitar acumulación de latencia si hay picos de carga.
             if guard.len() > MAX_QUEUED_SAMPLES {
                 let excess = guard.len() - MAX_QUEUED_SAMPLES;

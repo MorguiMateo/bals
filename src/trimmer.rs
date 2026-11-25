@@ -5,19 +5,19 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader,
+    IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader,
     MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE,
     MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_PD_DURATION,
     MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ANY_STREAM,
     MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_MEDIASOURCE,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFAudioFormat_AAC,
     MFAudioFormat_PCM, MFCreateAttributes, MFCreateMediaType, MFCreateSinkWriterFromURL,
     MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video,
     MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
     eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -32,18 +32,42 @@ pub struct TrimStats {
     pub elapsed_ms: f64,
 }
 
-/// Consulta rápidamente la duración real de un archivo `.mp4` en segundos (~2 ms)
-/// usando `IMFSourceReader` sin decodificar frames.
-pub fn probe_mp4_duration_secs(path: &Path) -> Result<f64> {
-    unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (probe) falló")?;
-    let res = probe_inner(path);
+/// Metadatos básicos de un clip `.mp4` obtenidos sin decodificar frames (~2 ms).
+#[derive(Debug, Clone, Copy)]
+pub struct ClipMetadata {
+    pub duration_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+}
+
+/// Frame decodificado en formato RGBA8 listo para renderizar en el Monitor CRT de la UI.
+#[derive(Debug, Clone)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub actual_time_secs: f64,
+}
+
+/// Consulta rápidamente duración, resolución y FPS reales de un `.mp4` sin decodificar (~2 ms).
+pub fn probe_mp4_metadata(path: &Path) -> Result<ClipMetadata> {
+    unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (probe_metadata) falló")?;
+    let res = probe_metadata_inner(path);
     unsafe {
         let _ = MFShutdown();
     }
     res
 }
 
-fn probe_inner(path: &Path) -> Result<f64> {
+/// Consulta rápidamente la duración real de un archivo `.mp4` en segundos (~2 ms)
+/// usando `IMFSourceReader` sin decodificar frames.
+#[allow(dead_code)]
+pub fn probe_mp4_duration_secs(path: &Path) -> Result<f64> {
+    Ok(probe_mp4_metadata(path)?.duration_secs)
+}
+
+fn probe_metadata_inner(path: &Path) -> Result<ClipMetadata> {
     let url = HSTRING::from(path.as_os_str());
     let reader: IMFSourceReader = unsafe { MFCreateSourceReaderFromURL(&url, None) }
         .with_context(|| format!("No se pudo abrir {} con IMFSourceReader", path.display()))?;
@@ -57,7 +81,199 @@ fn probe_inner(path: &Path) -> Result<f64> {
         .or_else(|_| i64::try_from(&prop).map(|v| v.max(0) as u64))
         .context("MF_PD_DURATION no es un entero válido")?;
 
-    Ok(duration_100ns as f64 / 10_000_000.0)
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut fps = 0.0f32;
+
+    for idx in 0..6u32 {
+        let Ok(native_type): windows::core::Result<IMFMediaType> =
+            (unsafe { reader.GetNativeMediaType(idx, 0) })
+        else {
+            break;
+        };
+        if unsafe { native_type.GetGUID(&MF_MT_MAJOR_TYPE) }.ok() == Some(MFMediaType_Video) {
+            if let Ok(packed) = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE) } {
+                let (w, h) = unpack_u32_pair(packed);
+                width = w;
+                height = h;
+            }
+            if let Ok(packed_fps) = unsafe { native_type.GetUINT64(&MF_MT_FRAME_RATE) } {
+                let (num, den) = unpack_u32_pair(packed_fps);
+                if num > 0 && den > 0 {
+                    fps = num as f32 / den as f32;
+                }
+            }
+            break;
+        }
+    }
+
+    Ok(ClipMetadata {
+        duration_secs: duration_100ns as f64 / 10_000_000.0,
+        width,
+        height,
+        fps,
+    })
+}
+
+/// Extrae un único frame de vista previa RGBA8 en `time_secs` (escalado a `max_w x max_h`)
+/// usando Media Foundation nativo sin dependencias externas.
+pub fn extract_mp4_frame_rgba(
+    path: &Path,
+    time_secs: f64,
+    max_w: u32,
+    max_h: u32,
+) -> Result<PreviewFrame> {
+    unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (preview) falló")?;
+    let res = extract_frame_inner(path, time_secs, max_w, max_h);
+    unsafe {
+        let _ = MFShutdown();
+    }
+    res
+}
+
+fn extract_frame_inner(
+    path: &Path,
+    time_secs: f64,
+    max_w: u32,
+    max_h: u32,
+) -> Result<PreviewFrame> {
+    let mut attrs: Option<IMFAttributes> = None;
+    unsafe { MFCreateAttributes(&mut attrs, 2) }?;
+    let attrs = attrs.context("MFCreateAttributes (preview) devolvió None")?;
+    unsafe {
+        attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+        attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
+    }
+
+    let url = HSTRING::from(path.as_os_str());
+    let reader: IMFSourceReader = unsafe { MFCreateSourceReaderFromURL(&url, Some(&attrs)) }
+        .with_context(|| format!("No se pudo abrir {} para vista previa", path.display()))?;
+
+    let mut video_idx: Option<u32> = None;
+    let mut src_w = 1280u32;
+    let mut src_h = 720u32;
+
+    for idx in 0..8u32 {
+        let Ok(native_type): windows::core::Result<IMFMediaType> =
+            (unsafe { reader.GetNativeMediaType(idx, 0) })
+        else {
+            break;
+        };
+        let major = unsafe { native_type.GetGUID(&MF_MT_MAJOR_TYPE) }.ok();
+        if major == Some(MFMediaType_Video) && video_idx.is_none() {
+            video_idx = Some(idx);
+            if let Ok(packed) = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE) } {
+                let (w, h) = unpack_u32_pair(packed);
+                if w > 0 && h > 0 {
+                    src_w = w;
+                    src_h = h;
+                }
+            }
+            unsafe { reader.SetStreamSelection(idx, true) }?;
+        } else {
+            let _ = unsafe { reader.SetStreamSelection(idx, false) };
+        }
+    }
+
+    let video_idx = video_idx.context("El archivo no tiene pista de video")?;
+
+    // Calcular dimensiones de preview manteniendo proporción y alineadas a pares.
+    let scale = (max_w as f64 / src_w as f64)
+        .min(max_h as f64 / src_h as f64)
+        .min(1.0);
+    let out_w = (((src_w as f64 * scale).round() as u32) & !1).max(64);
+    let out_h = (((src_h as f64 * scale).round() as u32) & !1).max(36);
+
+    let rgb_type = unsafe { MFCreateMediaType() }?;
+    unsafe {
+        rgb_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        rgb_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+        rgb_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(out_w, out_h))?;
+        reader.SetCurrentMediaType(video_idx, None, &rgb_type)?;
+    }
+
+    let target_100ns = (time_secs.max(0.0) * 10_000_000.0) as i64;
+    if target_100ns > 0 {
+        let pos = PROPVARIANT::from(target_100ns);
+        let _ = unsafe { reader.SetCurrentPosition(&GUID::zeroed(), &pos) };
+    }
+
+    // Consultar dimensiones y stride reales negociados tras SetCurrentMediaType.
+    let current_type = unsafe { reader.GetCurrentMediaType(video_idx) }?;
+    let (actual_w, actual_h) = unsafe { current_type.GetUINT64(&MF_MT_FRAME_SIZE) }
+        .map(unpack_u32_pair)
+        .unwrap_or((out_w, out_h));
+    let default_stride = unsafe { current_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+        .map(|u| u as i32)
+        .unwrap_or((actual_w * 4) as i32);
+
+    let mut chosen_sample: Option<(IMFSample, i64)> = None;
+    for _ in 0..90 {
+        let mut flags = 0u32;
+        let mut ts = 0i64;
+        let mut sample_opt: Option<IMFSample> = None;
+        unsafe {
+            reader.ReadSample(
+                video_idx,
+                0,
+                None,
+                Some(&mut flags),
+                Some(&mut ts),
+                Some(&mut sample_opt),
+            )
+        }
+        .context("ReadSample (preview) falló")?;
+
+        if let Some(sample) = sample_opt {
+            chosen_sample = Some((sample, ts));
+            if ts + 250_000 >= target_100ns {
+                break;
+            }
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
+            break;
+        }
+    }
+
+    let (sample, actual_ts) = chosen_sample.context("No se pudo decodificar ningún frame")?;
+    let buffer: IMFMediaBuffer = unsafe { sample.ConvertToContiguousBuffer() }?;
+
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut cur_len = 0u32;
+    unsafe { buffer.Lock(&mut ptr, None, Some(&mut cur_len)) }?;
+
+    let w = actual_w as usize;
+    let h = actual_h as usize;
+    let row_stride = default_stride.unsigned_abs().max((w * 4) as u32) as usize;
+    let flip_y = default_stride < 0;
+    let mut rgba = vec![0u8; w * h * 4];
+
+    if !ptr.is_null() && cur_len as usize >= row_stride * h {
+        let src = unsafe { std::slice::from_raw_parts(ptr, cur_len as usize) };
+        for y in 0..h {
+            let src_y = if flip_y { h - 1 - y } else { y };
+            let src_row = &src[src_y * row_stride..src_y * row_stride + w * 4];
+            let dst_row = &mut rgba[y * w * 4..(y + 1) * w * 4];
+            for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+                // RGB32 en Windows es BGRA/BGRX little-endian.
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 255;
+            }
+        }
+    }
+
+    unsafe {
+        let _ = buffer.Unlock();
+    }
+
+    Ok(PreviewFrame {
+        width: actual_w,
+        height: actual_h,
+        rgba,
+        actual_time_secs: actual_ts.max(0) as f64 / 10_000_000.0,
+    })
 }
 
 /// Recorta un clip `.mp4` entre `[start_secs, end_secs]` en modo **passthrough (sin recodificar)**
@@ -714,5 +930,22 @@ mod tests {
         assert!(probed_out > 1.0);
 
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn probes_metadata_and_extracts_preview_frame() {
+        let Some(mp4) = find_sample_mp4() else {
+            return;
+        };
+
+        let meta = probe_mp4_metadata(&mp4).expect("probe_mp4_metadata falló");
+        assert!(meta.duration_secs > 1.0);
+        assert!(meta.width >= 320 && meta.height >= 200);
+
+        let frame = extract_mp4_frame_rgba(&mp4, 0.5, 384, 216)
+            .expect("extract_mp4_frame_rgba falló");
+        assert!(frame.width >= 64 && frame.width <= 384);
+        assert!(frame.height >= 36 && frame.height <= 216);
+        assert_eq!(frame.rgba.len(), (frame.width * frame.height * 4) as usize);
     }
 }

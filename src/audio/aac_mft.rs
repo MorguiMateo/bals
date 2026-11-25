@@ -1,9 +1,10 @@
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use tracing::info;
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaBuffer, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    IMFActivate, IMFMediaBuffer, IMFSample, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE,
     MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
     MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
@@ -34,6 +35,7 @@ pub struct AacEncoder {
     pub channels: u16,
     mft_provides_output_samples: bool,
     output_buffer_size: u32,
+    reusable_out_sample: Option<IMFSample>,
     mf_started: bool,
 }
 
@@ -131,6 +133,7 @@ impl AacEncoder {
             channels: config.channels,
             mft_provides_output_samples,
             output_buffer_size,
+            reusable_out_sample: None,
             mf_started: true,
         })
     }
@@ -182,6 +185,11 @@ impl AacEncoder {
         loop {
             let provided_sample = if self.mft_provides_output_samples {
                 None
+            } else if let Some(cached) = self.reusable_out_sample.take() {
+                if let Ok(buf) = unsafe { cached.GetBufferByIndex(0) } {
+                    let _ = unsafe { buf.SetCurrentLength(0) };
+                }
+                Some(cached)
             } else {
                 let sample = unsafe { MFCreateSample() }?;
                 let buffer = unsafe { MFCreateMemoryBuffer(self.output_buffer_size) }?;
@@ -203,7 +211,12 @@ impl AacEncoder {
 
             match hr {
                 Ok(()) => {}
-                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    if !self.mft_provides_output_samples {
+                        self.reusable_out_sample = out_sample;
+                    }
+                    break;
+                }
                 Err(err) => return Err(err).context("AAC MFT ProcessOutput falló"),
             }
 
@@ -219,13 +232,18 @@ impl AacEncoder {
             let mut ptr: *mut u8 = std::ptr::null_mut();
             let mut len = 0u32;
             unsafe { buffer.Lock(&mut ptr, None, Some(&mut len)) }?;
-            let data = if !ptr.is_null() && len > 0 {
-                unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec()
+            let data: Arc<[u8]> = if !ptr.is_null() && len > 0 {
+                Arc::from(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
             } else {
-                Vec::new()
+                Arc::from([])
             };
             unsafe {
                 let _ = buffer.Unlock();
+            }
+            drop(buffer);
+
+            if !self.mft_provides_output_samples {
+                self.reusable_out_sample = Some(sample);
             }
 
             if !data.is_empty() {

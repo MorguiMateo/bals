@@ -4,7 +4,7 @@ pub mod meter;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use crate::config::AudioConfig;
 /// Paquete AAC-LC codificado (payload raw) con marca de tiempo en el mismo reloj QPC que el video.
 #[derive(Debug, Clone)]
 pub struct EncodedAudioPacket {
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
     /// Timestamp absoluto de presentación en ticks de 100 ns (`clock::now_100ns()`).
     pub pts_100ns: i64,
     /// Duración del paquete en ticks de 100 ns (~213_333 para 1024 muestras @ 48 kHz).
@@ -44,6 +44,8 @@ pub struct AudioStreamInfo {
 pub struct AudioPipeline {
     pub rx: Receiver<EncodedAudioPacket>,
     pub stream_info: AudioStreamInfo,
+    game_volume_bits: Arc<AtomicU32>,
+    mic_volume_bits: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     mixer_handle: Option<JoinHandle<()>>,
     _game_stream: WasapiStream,
@@ -69,16 +71,29 @@ impl AudioPipeline {
 
         let game_queue = Arc::clone(&game_stream.samples);
         let mic_queue = mic_stream.as_ref().map(|m| Arc::clone(&m.samples));
+        let game_volume_bits = Arc::new(AtomicU32::new(config.game_volume.to_bits()));
+        let mic_volume_bits = Arc::new(AtomicU32::new(config.mic_volume.to_bits()));
 
         let (tx, rx) = bounded::<EncodedAudioPacket>(256);
         let (info_tx, info_rx) = crossbeam_channel::bounded::<Result<AudioStreamInfo>>(1);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        let g_vol_clone = Arc::clone(&game_volume_bits);
+        let m_vol_clone = Arc::clone(&mic_volume_bits);
 
         let mixer_handle = thread::Builder::new()
             .name("bals-audio-mixer-aac".to_string())
             .spawn(move || {
-                mixer_aac_thread(config, game_queue, mic_queue, tx, info_tx, stop_clone);
+                mixer_aac_thread(
+                    config,
+                    game_queue,
+                    mic_queue,
+                    g_vol_clone,
+                    m_vol_clone,
+                    tx,
+                    info_tx,
+                    stop_clone,
+                );
             })
             .context("No se pudo iniciar el hilo mezclador/encoder AAC")?;
 
@@ -95,11 +110,21 @@ impl AudioPipeline {
         Ok(Self {
             rx,
             stream_info,
+            game_volume_bits,
+            mic_volume_bits,
             stop,
             mixer_handle: Some(mixer_handle),
             _game_stream: game_stream,
             _mic_stream: mic_stream,
         })
+    }
+
+    /// Ajusta volúmenes de juego y micrófono en vivo sin reiniciar la grabación ni perder el Replay Buffer.
+    pub fn set_volumes(&self, game_volume: f32, mic_volume: f32) {
+        self.game_volume_bits
+            .store(game_volume.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+        self.mic_volume_bits
+            .store(mic_volume.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {
@@ -116,10 +141,13 @@ impl Drop for AudioPipeline {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mixer_aac_thread(
     config: AudioConfig,
     game_queue: Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
     mic_queue: Option<Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>>,
+    game_volume_bits: Arc<AtomicU32>,
+    mic_volume_bits: Arc<AtomicU32>,
     tx: crossbeam_channel::Sender<EncodedAudioPacket>,
     info_tx: crossbeam_channel::Sender<Result<AudioStreamInfo>>,
     stop: Arc<AtomicBool>,
@@ -173,9 +201,9 @@ fn mixer_aac_thread(
             mic_buf.fill(0.0);
         }
 
-        // Mezcla en punto flotante con soft-clipping `tanh` para evitar saturación brusca.
-        let g_vol = config.game_volume;
-        let m_vol = config.mic_volume;
+        // Mezcla en punto flotante con ganancia en vivo y soft-clipping `tanh`.
+        let g_vol = f32::from_bits(game_volume_bits.load(Ordering::Relaxed));
+        let m_vol = f32::from_bits(mic_volume_bits.load(Ordering::Relaxed));
         for i in 0..SAMPLES_PER_CHUNK {
             let mixed = game_buf[i] * g_vol + mic_buf[i] * m_vol;
             let limited = if mixed.abs() > 0.95 {
@@ -218,15 +246,26 @@ fn mixer_aac_thread(
     }
 }
 
+/// Copia contigua por slices (`as_slices`) reduciendo el tiempo bajo lock del mutex.
 fn drain_or_silence(
     queue: &std::sync::Mutex<std::collections::VecDeque<f32>>,
     out: &mut [f32],
 ) {
-    let mut guard = queue.lock().unwrap();
-    let available = guard.len().min(out.len());
-    for sample in out.iter_mut().take(available) {
-        *sample = guard.pop_front().unwrap();
-    }
+    let available = {
+        let mut guard = queue.lock().unwrap();
+        let avail = guard.len().min(out.len());
+        if avail > 0 {
+            let (s1, s2) = guard.as_slices();
+            let n1 = avail.min(s1.len());
+            out[..n1].copy_from_slice(&s1[..n1]);
+            if n1 < avail {
+                let n2 = avail - n1;
+                out[n1..avail].copy_from_slice(&s2[..n2]);
+            }
+            guard.drain(..avail);
+        }
+        avail
+    };
     if available < out.len() {
         out[available..].fill(0.0);
     }

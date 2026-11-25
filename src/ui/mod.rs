@@ -1,49 +1,59 @@
+mod clips_view;
+mod settings_view;
+mod theme;
+mod widgets;
+
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use eframe::egui;
+use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::audio::meter::AudioLevelMonitor;
-use crate::config::{
-    AppConfig, AudioCaptureMode, CaptureMode, FrameRate, QualityPreset, ReplayDuration, Resolution,
-    VideoConfig,
-};
+use crate::config::{AppConfig, UiTheme};
 use crate::hotkey::parse_hotkey;
-use crate::ipc;
+use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
 use crate::trimmer::{
-    TrimStats, compress_mp4_to_target_mb, probe_mp4_duration_secs, suggested_output_with_suffix,
-    suggested_trim_output, trim_mp4_passthrough,
+    ClipMetadata, PreviewFrame, TrimStats, compress_mp4_to_target_mb, extract_mp4_frame_rgba,
+    probe_mp4_metadata, suggested_output_with_suffix, suggested_trim_output, trim_mp4_passthrough,
+};
+use crate::ui::theme::{RetroPalette, apply_egui_theme};
+use crate::ui::widgets::{
+    TrimDragHandle, draw_crt_recess, draw_mini_bezel_vu, draw_scanlines, draw_status_led,
+    draw_vent_grille, hardware_action_button, hardware_tab_button,
 };
 use crate::updater::{self, CURRENT_VERSION, ReleaseInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub(crate) enum Tab {
     Settings,
     Clips,
 }
 
 #[derive(Debug, Clone)]
-struct ClipEntry {
-    path: PathBuf,
-    name: String,
-    size_mb: f64,
-    modified: SystemTime,
+pub(crate) struct ClipEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub size_mb: f64,
+    pub modified: SystemTime,
 }
 
-enum TrimState {
+pub(crate) enum TrimState {
     Idle,
     Running,
     Done(TrimStats),
     Error(String),
 }
 
-enum UpdateUiState {
+pub(crate) enum UpdateUiState {
     Idle,
     Checking,
     UpToDate,
@@ -52,50 +62,110 @@ enum UpdateUiState {
     Error(String),
 }
 
-struct BalsUiApp {
-    tab: Tab,
-    cfg: AppConfig,
-    start_with_windows: bool,
-    extra_games_text: String,
-    hotkey_error: Option<String>,
-    banner_msg: Option<(String, bool)>,
-    daemon_running: bool,
-    update_state: Arc<Mutex<UpdateUiState>>,
-    audio_meter: AudioLevelMonitor,
+struct PreviewResult {
+    request_id: u64,
+    frame: PreviewFrame,
+}
 
-    // Galería y recortador
-    clips: Vec<ClipEntry>,
-    selected_clip: Option<PathBuf>,
-    selected_duration: Option<f64>,
-    trim_start: f64,
-    trim_end: f64,
-    trim_state: Arc<Mutex<TrimState>>,
+pub(crate) struct BalsUiApp {
+    pub tab: Tab,
+    pub cfg: AppConfig,
+    pub applied_theme: Option<UiTheme>,
+    pub start_with_windows: bool,
+    pub extra_games_text: String,
+    pub hotkey_error: Option<String>,
+    pub listening_hotkey: bool,
+    pub banner_msg: Option<(String, bool, Instant)>,
+
+    // Estado en vivo del daemon vía memoria compartida
+    pub daemon_running: bool,
+    pub telemetry: Option<EngineTelemetrySnapshot>,
+    pub last_telemetry_poll: Instant,
+    pub last_clip_event_seq: u32,
+
+    // Auto-updater y audio VU con peak-hold
+    pub update_state: Arc<Mutex<UpdateUiState>>,
+    pub audio_meter: AudioLevelMonitor,
+    pub desktop_peak_hold: f32,
+    pub mic_peak_hold: f32,
+
+    // Logo pixel-art CRT embebido
+    pub logo_texture: Option<egui::TextureHandle>,
+
+    // Galería, Monitor CRT y recortador
+    pub clips: Vec<ClipEntry>,
+    pub clip_filter: String,
+    pub selected_clip: Option<PathBuf>,
+    pub selected_metadata: Option<ClipMetadata>,
+    pub selected_duration: Option<f64>,
+    pub trim_start: f64,
+    pub trim_end: f64,
+    pub trim_drag_handle: Option<TrimDragHandle>,
+    pub trim_state: Arc<Mutex<TrimState>>,
+    pub confirm_delete: Option<PathBuf>,
+
+    // Vista previa de frame CRT asíncrona con debounce
+    pub preview_texture: Option<egui::TextureHandle>,
+    pub preview_time_secs: f64,
+    pub preview_loading: bool,
+    preview_req_counter: Arc<AtomicU64>,
+    preview_ready: Arc<Mutex<Option<PreviewResult>>>,
+    pending_preview_seek: Option<(f64, Instant)>,
 }
 
 impl BalsUiApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let cfg = AppConfig::load_or_create();
         let start_with_windows = startup::is_autostart_enabled();
         let extra_games_text = cfg.extra_game_exes.join(", ");
         let clips = scan_clips(&cfg.clips_dir);
         let daemon_running = ipc::is_daemon_running();
+        let telemetry = ipc::read_engine_telemetry();
+        let last_clip_event_seq = telemetry.as_ref().map_or(0, |t| t.clip_event_seq);
+
+        // Cargar ícono CRT 64×64 pixel-art con filtrado NEAREST (sin blur).
+        let raw_icon = include_bytes!("../../assets/icon_64.rgba");
+        let logo_img = egui::ColorImage::from_rgba_unmultiplied([64, 64], raw_icon);
+        let logo_texture = Some(ctx.load_texture(
+            "bals_crt_logo",
+            logo_img,
+            egui::TextureOptions::NEAREST,
+        ));
 
         let mut app = Self {
             tab: Tab::Settings,
             cfg,
+            applied_theme: None,
             start_with_windows,
             extra_games_text,
             hotkey_error: None,
+            listening_hotkey: false,
             banner_msg: None,
             daemon_running,
+            telemetry,
+            last_telemetry_poll: Instant::now(),
+            last_clip_event_seq,
             update_state: Arc::new(Mutex::new(UpdateUiState::Idle)),
             audio_meter: AudioLevelMonitor::start(),
+            desktop_peak_hold: 0.0,
+            mic_peak_hold: 0.0,
+            logo_texture,
             clips,
+            clip_filter: String::new(),
             selected_clip: None,
+            selected_metadata: None,
             selected_duration: None,
             trim_start: 0.0,
             trim_end: 10.0,
+            trim_drag_handle: None,
             trim_state: Arc::new(Mutex::new(TrimState::Idle)),
+            confirm_delete: None,
+            preview_texture: None,
+            preview_time_secs: 0.0,
+            preview_loading: false,
+            preview_req_counter: Arc::new(AtomicU64::new(0)),
+            preview_ready: Arc::new(Mutex::new(None)),
+            pending_preview_seek: None,
         };
 
         if let Some(first) = app.clips.first().cloned() {
@@ -104,34 +174,88 @@ impl BalsUiApp {
         app
     }
 
-    fn refresh_clips(&mut self) {
+    pub fn set_banner(&mut self, msg: impl Into<String>, is_err: bool) {
+        self.banner_msg = Some((msg.into(), is_err, Instant::now()));
+    }
+
+    pub fn refresh_clips(&mut self) {
         self.clips = scan_clips(&self.cfg.clips_dir);
         if let Some(sel) = &self.selected_clip {
             if !sel.exists() {
                 self.selected_clip = None;
+                self.selected_metadata = None;
                 self.selected_duration = None;
+                self.preview_texture = None;
+            }
+        }
+        if self.selected_clip.is_none() {
+            if let Some(first) = self.clips.first().cloned() {
+                self.select_clip(first.path);
             }
         }
     }
 
-    fn select_clip(&mut self, path: PathBuf) {
-        let dur = probe_mp4_duration_secs(&path).ok();
+    pub fn select_clip(&mut self, path: PathBuf) {
+        let meta = probe_mp4_metadata(&path).ok();
+        let dur = meta.map(|m| m.duration_secs);
         self.selected_clip = Some(path);
+        self.selected_metadata = meta;
         self.selected_duration = dur;
         self.trim_start = 0.0;
         self.trim_end = dur.unwrap_or(10.0);
+        self.confirm_delete = None;
+        self.preview_texture = None;
+        self.preview_time_secs = 0.0;
         if let Ok(mut st) = self.trim_state.lock() {
             *st = TrimState::Idle;
         }
+        self.request_preview_frame(0.2_f64.min(dur.unwrap_or(0.0)));
     }
 
-    fn save_config(&mut self) {
+    pub fn schedule_preview_seek(&mut self, time_secs: f64) {
+        self.preview_time_secs = time_secs;
+        self.pending_preview_seek = Some((time_secs, Instant::now()));
+    }
+
+    fn request_preview_frame(&mut self, time_secs: f64) {
+        let Some(path) = self.selected_clip.clone() else {
+            return;
+        };
+        let req_id = self.preview_req_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let counter = Arc::clone(&self.preview_req_counter);
+        let ready = Arc::clone(&self.preview_ready);
+        self.preview_loading = true;
+        self.preview_time_secs = time_secs;
+
+        std::thread::Builder::new()
+            .name("bals-crt-preview".to_string())
+            .spawn(move || {
+                // Cancelación temprana si ya llegó una solicitud más nueva.
+                if counter.load(Ordering::Relaxed) != req_id {
+                    return;
+                }
+                if let Ok(frame) = extract_mp4_frame_rgba(&path, time_secs, 448, 252) {
+                    if counter.load(Ordering::Relaxed) == req_id {
+                        if let Ok(mut slot) = ready.lock() {
+                            *slot = Some(PreviewResult {
+                                request_id: req_id,
+                                frame,
+                            });
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    pub fn save_config(&mut self) {
         if let Err(err) = parse_hotkey(&self.cfg.save_clip_hotkey) {
             self.hotkey_error = Some(format!("{err}"));
-            self.banner_msg = Some(("Corrige el atajo de teclado antes de guardar.".into(), true));
+            self.set_banner("Corrige el atajo de teclado antes de guardar.", true);
             return;
         }
         self.hotkey_error = None;
+        self.listening_hotkey = false;
 
         self.cfg.extra_game_exes = self
             .extra_games_text
@@ -141,7 +265,7 @@ impl BalsUiApp {
             .collect();
 
         if let Err(err) = startup::set_autostart_enabled(self.start_with_windows) {
-            self.banner_msg = Some((format!("Error configurando inicio con Windows: {err:#}"), true));
+            self.set_banner(format!("Error configurando inicio Windows: {err:#}"), true);
             return;
         }
 
@@ -149,21 +273,21 @@ impl BalsUiApp {
             Ok(()) => {
                 self.daemon_running = ipc::is_daemon_running();
                 if ipc::notify_reload_config() {
-                    self.banner_msg = Some(("Ajustes guardados y aplicados al instante.".into(), false));
+                    self.set_banner("CONFIG GUARDADA Y APLICADA EN VIVO.", false);
                 } else {
-                    self.banner_msg = Some((
-                        "Ajustes guardados en config.toml (inicia Bals en bandeja para aplicar).".into(),
+                    self.set_banner(
+                        "Config guardada en config.toml (inicia Bals en bandeja).",
                         false,
-                    ));
+                    );
                 }
             }
             Err(err) => {
-                self.banner_msg = Some((format!("Error guardando config: {err:#}"), true));
+                self.set_banner(format!("Error guardando config: {err:#}"), true);
             }
         }
     }
 
-    fn start_trim(&mut self) {
+    pub fn start_trim(&mut self) {
         let Some(input_path) = self.selected_clip.clone() else {
             return;
         };
@@ -190,7 +314,7 @@ impl BalsUiApp {
         });
     }
 
-    fn start_compress(&mut self, target_mb: f64, suffix: &'static str) {
+    pub fn start_compress(&mut self, target_mb: f64, suffix: &'static str) {
         let Some(input_path) = self.selected_clip.clone() else {
             return;
         };
@@ -217,7 +341,7 @@ impl BalsUiApp {
         });
     }
 
-    fn check_for_updates(&self) {
+    pub fn check_for_updates(&self) {
         let state_arc = Arc::clone(&self.update_state);
         if let Ok(mut st) = state_arc.lock() {
             if matches!(*st, UpdateUiState::Checking | UpdateUiState::Downloading) {
@@ -237,14 +361,14 @@ impl BalsUiApp {
         });
     }
 
-    fn install_update(&self, info: ReleaseInfo) {
+    pub fn install_update(&self, info: ReleaseInfo) {
         let state_arc = Arc::clone(&self.update_state);
         if let Ok(mut st) = state_arc.lock() {
             *st = UpdateUiState::Downloading;
         }
         std::thread::spawn(move || {
             ipc::notify_shutdown();
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(250));
             match updater::download_and_apply_update(&info, &[]) {
                 Ok(()) => std::process::exit(0),
                 Err(err) => {
@@ -254,6 +378,197 @@ impl BalsUiApp {
                 }
             }
         });
+    }
+
+    fn poll_background_states(&mut self, ctx: &egui::Context) -> bool {
+        // 1. Telemetría compartida daemon → UI cada 200 ms (0 I/O en disco).
+        if self.last_telemetry_poll.elapsed() >= Duration::from_millis(200) {
+            self.last_telemetry_poll = Instant::now();
+            self.daemon_running = ipc::is_daemon_running();
+            if self.daemon_running {
+                if let Some(tel) = ipc::read_engine_telemetry() {
+                    if tel.clip_event_seq != self.last_clip_event_seq && tel.clip_event_seq > 0 {
+                        self.last_clip_event_seq = tel.clip_event_seq;
+                        if !tel.last_event.is_empty() {
+                            self.set_banner(tel.last_event.clone(), tel.clip_event_is_err);
+                        }
+                        if !tel.clip_event_is_err {
+                            self.refresh_clips();
+                        }
+                    }
+                    self.telemetry = Some(tel);
+                }
+            } else {
+                self.telemetry = None;
+            }
+        }
+
+        // 2. Preview CRT debounced (90 ms tras arrastrar [IN]/[OUT]).
+        if let Some((seek_t, at)) = self.pending_preview_seek {
+            if at.elapsed() >= Duration::from_millis(90) {
+                self.pending_preview_seek = None;
+                self.request_preview_frame(seek_t);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(40));
+            }
+        }
+
+        // 3. Cargar textura si el worker terminó de decodificar el frame CRT.
+        if let Ok(mut slot) = self.preview_ready.lock() {
+            if let Some(res) = slot.take() {
+                if res.request_id == self.preview_req_counter.load(Ordering::Relaxed) {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [res.frame.width as usize, res.frame.height as usize],
+                        &res.frame.rgba,
+                    );
+                    self.preview_texture = Some(ctx.load_texture(
+                        "bals_crt_preview",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                    self.preview_time_secs = res.frame.actual_time_secs;
+                    self.preview_loading = false;
+                }
+            }
+        }
+        if self.preview_loading {
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+
+        // 4. Estado del trimmer / compresor en segundo plano.
+        let mut finished_trim_msg: Option<(String, bool)> = None;
+        let mut trim_in_progress = false;
+        if let Ok(mut st) = self.trim_state.lock() {
+            match &*st {
+                TrimState::Running => trim_in_progress = true,
+                TrimState::Done(stats) => {
+                    let name = stats
+                        .output_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    finished_trim_msg = Some((
+                        format!(
+                            "OK ({:.0}ms): {name} ({:.1}s · {:.1} MB)",
+                            stats.elapsed_ms,
+                            stats.duration_secs,
+                            stats.output_bytes as f64 / (1024.0 * 1024.0)
+                        ),
+                        false,
+                    ));
+                    *st = TrimState::Idle;
+                }
+                TrimState::Error(msg) => {
+                    finished_trim_msg = Some((format!("ERROR: {msg}"), true));
+                    *st = TrimState::Idle;
+                }
+                TrimState::Idle => {}
+            }
+        }
+        if trim_in_progress {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        if let Some((msg, is_err)) = finished_trim_msg {
+            self.set_banner(msg, is_err);
+            self.refresh_clips();
+        }
+
+        // 5. Limpiar toast temporal tras 6 segundos.
+        if let Some((_, _, at)) = &self.banner_msg {
+            if at.elapsed() > Duration::from_secs(6) {
+                self.banner_msg = None;
+            }
+        }
+
+        // 6. Actualizar peak-hold de los medidores VU.
+        let d_lvl = (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
+        if d_lvl >= self.desktop_peak_hold {
+            self.desktop_peak_hold = d_lvl;
+        } else {
+            self.desktop_peak_hold = (self.desktop_peak_hold - 0.018).max(0.0);
+        }
+
+        let m_lvl = if self.cfg.mic_enabled {
+            (self.audio_meter.mic_level() * self.cfg.mic_volume).min(1.0)
+        } else {
+            0.0
+        };
+        if m_lvl >= self.mic_peak_hold {
+            self.mic_peak_hold = m_lvl;
+        } else {
+            self.mic_peak_hold = (self.mic_peak_hold - 0.018).max(0.0);
+        }
+
+        // Pausar cadencia alta del VU cuando la ventana pierde foco.
+        let focused = ctx.input(|i| i.focused);
+        self.audio_meter.set_paused(!focused);
+
+        trim_in_progress
+    }
+
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        // Si estamos capturando una tecla nueva para el atajo global:
+        if self.listening_hotkey {
+            let captured = ctx.input(|i| {
+                for ev in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = ev
+                    {
+                        if *key == egui::Key::Escape {
+                            return Some(None);
+                        }
+                        if let Some(spec) = egui_key_to_hotkey_spec(*key, *modifiers) {
+                            return Some(Some(spec));
+                        }
+                    }
+                }
+                None
+            });
+
+            if let Some(res) = captured {
+                self.listening_hotkey = false;
+                if let Some(spec) = res {
+                    self.cfg.save_clip_hotkey = spec;
+                    self.hotkey_error = parse_hotkey(&self.cfg.save_clip_hotkey)
+                        .err()
+                        .map(|e| format!("{e}"));
+                }
+            }
+            return;
+        }
+
+        // Atajos de consola cuando ningún cuadro de texto tiene foco.
+        let text_editing = ctx.egui_wants_keyboard_input();
+        let (switch_settings, switch_clips, save_now, toggle_rec) = ctx.input(|i| {
+            let ctrl_s = i.modifiers.ctrl && i.key_pressed(egui::Key::S);
+            let f1 = i.key_pressed(egui::Key::F1);
+            let f2 = i.key_pressed(egui::Key::F2);
+            let f5 = i.key_pressed(egui::Key::F5);
+            let q = !text_editing && !i.modifiers.any() && i.key_pressed(egui::Key::Q);
+            let e = !text_editing && !i.modifiers.any() && i.key_pressed(egui::Key::E);
+            (f1 || q, f2 || e, ctrl_s, f5)
+        });
+
+        if switch_settings {
+            self.tab = Tab::Settings;
+        }
+        if switch_clips {
+            if self.tab != Tab::Clips {
+                self.refresh_clips();
+            }
+            self.tab = Tab::Clips;
+        }
+        if save_now && self.tab == Tab::Settings {
+            self.save_config();
+        }
+        if toggle_rec && self.daemon_running {
+            ipc::notify_toggle_record();
+            self.set_banner("Estado de grabación alternado.", false);
+        }
     }
 }
 
@@ -271,8 +586,8 @@ pub fn run_gui() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Bals")
             .with_icon(Arc::new(icon))
-            .with_inner_size([800.0, 560.0])
-            .with_min_inner_size([660.0, 460.0]),
+            .with_inner_size([980.0, 650.0])
+            .with_min_inner_size([860.0, 580.0]),
         ..Default::default()
     };
 
@@ -280,601 +595,439 @@ pub fn run_gui() -> Result<()> {
         "Bals",
         options,
         Box::new(|cc| {
-            configure_style(&cc.egui_ctx);
-            Ok(Box::new(BalsUiApp::new()))
+            let app = BalsUiApp::new(&cc.egui_ctx);
+            let p = RetroPalette::for_theme(app.cfg.ui_theme);
+            apply_egui_theme(&cc.egui_ctx, &p);
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Error ejecutando ventana UI de Bals: {e}"))
 }
 
-fn configure_style(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.selection.bg_fill = egui::Color32::from_rgb(16, 185, 129); // verde esmeralda Bals
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(5, 150, 105);
-    ctx.set_visuals(visuals);
-}
-
 impl eframe::App for BalsUiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Si hay un recorte en progreso, comprobar si terminó y refrescar la galería.
-        let mut finished_trim_msg: Option<(String, bool)> = None;
-        let mut trim_in_progress = false;
-        if let Ok(mut st) = self.trim_state.lock() {
-            match &*st {
-                TrimState::Running => {
-                    trim_in_progress = true;
-                }
-                TrimState::Done(stats) => {
-                    let name = stats
-                        .output_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    finished_trim_msg = Some((
-                        format!(
-                            "Clip recortado en {:.0} ms: {name} ({:.1} s · {:.1} MB)",
-                            stats.elapsed_ms,
-                            stats.duration_secs,
-                            stats.output_bytes as f64 / (1024.0 * 1024.0)
-                        ),
-                        false,
-                    ));
-                    *st = TrimState::Idle;
-                }
-                TrimState::Error(msg) => {
-                    finished_trim_msg = Some((format!("Error recortando: {msg}"), true));
-                    *st = TrimState::Idle;
-                }
-                TrimState::Idle => {}
-            }
-        }
-        if trim_in_progress {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(80));
-        }
-        if let Some(msg) = finished_trim_msg {
-            self.banner_msg = Some(msg);
-            self.refresh_clips();
+        let ctx = ui.ctx().clone();
+
+        // Reaplicar estilo al instante si el usuario cambió el tema retro.
+        if self.applied_theme != Some(self.cfg.ui_theme) {
+            let p = RetroPalette::for_theme(self.cfg.ui_theme);
+            apply_egui_theme(&ctx, &p);
+            self.applied_theme = Some(self.cfg.ui_theme);
         }
 
-        // Barra superior
-        egui::Panel::top("bals_header").show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(
-                    egui::RichText::new("Bals")
-                        .strong()
-                        .color(egui::Color32::from_rgb(52, 211, 153)),
-                );
-                ui.label(egui::RichText::new(format!("v{CURRENT_VERSION}")).weak());
+        let p = RetroPalette::for_theme(self.cfg.ui_theme);
+        self.handle_keyboard_shortcuts(&ctx);
+        let trim_in_progress = self.poll_background_states(&ctx);
 
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Ajustes");
-                if ui
-                    .selectable_value(
-                        &mut self.tab,
-                        Tab::Clips,
-                        format!("🎬 Clips y Recortador ({})", self.clips.len()),
-                    )
-                    .clicked()
-                {
-                    self.refresh_clips();
-                }
+        // Refresco fluido para VU meters y pulso LED (~25 FPS activo, ~5 FPS en segundo plano).
+        let repaint_ms = if ctx.input(|i| i.focused) { 40 } else { 200 };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.daemon_running {
-                        if ui
-                            .button(format!("💾 Guardar clip [{}]", self.cfg.save_clip_hotkey))
-                            .clicked()
-                        {
-                            ipc::notify_save_clip();
-                            self.banner_msg =
-                                Some(("Solicitud de clip enviada al motor.".into(), false));
-                        }
-                        if ui.button("⏯ Play / Pausa").clicked() {
-                            ipc::notify_toggle_record();
-                            self.banner_msg =
-                                Some(("Estado de grabación alternado.".into(), false));
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new("● Motor detenido")
-                                .color(egui::Color32::from_rgb(248, 113, 113)),
+        let time_s = ctx.input(|i| i.time) as f32;
+        let rec_pulse = ((time_s * 3.8).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+
+        // =========================================================================
+        // 1. BISEL SUPERIOR DE CARCASA HARDWARE CRT (Opción C)
+        // =========================================================================
+        let top_frame = egui::Frame::new()
+            .fill(p.chassis_bg)
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .stroke(Stroke::new(1.5, p.chassis_outline));
+
+        egui::Panel::top("bals_crt_top_bezel")
+            .frame(top_frame)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Ícono pixel-art CRT + Branding BALS
+                    if let Some(tex) = &self.logo_texture {
+                        let (lrect, _) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
+                        ui.painter().image(
+                            tex.id(),
+                            lrect,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
                         );
                     }
-                });
-            });
-            ui.add_space(4.0);
-        });
-
-        // Barra inferior de estado / notificaciones
-        if let Some((msg, is_err)) = &self.banner_msg {
-            egui::Panel::bottom("bals_banner").show(ui, |ui| {
-                ui.add_space(4.0);
-                let color = if *is_err {
-                    egui::Color32::from_rgb(248, 113, 113)
-                } else {
-                    egui::Color32::from_rgb(52, 211, 153)
-                };
-                ui.label(egui::RichText::new(msg).color(color));
-                ui.add_space(4.0);
-            });
-        }
-
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Settings => self.render_settings_tab(ui),
-            Tab::Clips => self.render_clips_tab(ui, trim_in_progress),
-        });
-    }
-}
-
-impl BalsUiApp {
-    fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(6.0);
-
-            // 1. Video y Rendimiento
-            ui.group(|ui| {
-                ui.strong("Video (Codificación GPU Zero-Copy)");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Resolución:");
-                    ui.selectable_value(&mut self.cfg.resolution, Resolution::P720, "720p (Ultra liviano)");
-                    ui.selectable_value(&mut self.cfg.resolution, Resolution::P1080, "1080p (Full HD)");
-                    ui.selectable_value(&mut self.cfg.resolution, Resolution::P1440, "2K (1440p)");
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Cuadros por segundo:");
-                    ui.selectable_value(&mut self.cfg.fps, FrameRate::Fps30, "30 fps");
-                    ui.selectable_value(&mut self.cfg.fps, FrameRate::Fps60, "60 fps");
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Calidad / Peso:");
-                    ui.selectable_value(
-                        &mut self.cfg.quality,
-                        QualityPreset::Compact,
-                        "Ahorro (-45% peso)",
-                    );
-                    ui.selectable_value(&mut self.cfg.quality, QualityPreset::Balanced, "Normal");
-                    ui.selectable_value(&mut self.cfg.quality, QualityPreset::High, "Alta");
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Duración del clip (Replay Buffer):");
-                    ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec15, "15 s");
-                    ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec30, "30 s");
-                    ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec60, "60 s");
-                    ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec120, "120 s");
-                });
-
-                let bitrate_bps = VideoConfig::recommended_bitrate_for(
-                    self.cfg.resolution,
-                    self.cfg.fps,
-                    self.cfg.quality,
-                );
-                let est_ram_mb = (bitrate_bps as f64 / 8.0) * self.cfg.replay_duration.as_secs() as f64
-                    / (1024.0 * 1024.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Bitrate objetivo: {:.1} Mbps · RAM estimada del buffer: ~{:.1} MB · Uso de disco mientras juegas: 0 MB/s",
-                        bitrate_bps as f64 / 1_000_000.0,
-                        est_ram_mb
-                    ))
-                    .small()
-                    .weak(),
-                );
-            });
-
-            ui.add_space(8.0);
-
-            // 2. Modo de captura y Hotkey
-            ui.group(|ui| {
-                ui.strong("Activación y Atajo Global");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Modo:");
-                    ui.selectable_value(
-                        &mut self.cfg.capture_mode,
-                        CaptureMode::AutoDetectGames,
-                        "Detectar juegos automáticamente (0% GPU en escritorio)",
-                    );
-                    ui.selectable_value(
-                        &mut self.cfg.capture_mode,
-                        CaptureMode::ManualMonitor,
-                        "Manual (Play / Pausa)",
-                    );
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Tecla para guardar clip:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.save_clip_hotkey)
-                            .desired_width(110.0),
-                    );
-                    if resp.changed() {
-                        self.hotkey_error = parse_hotkey(&self.cfg.save_clip_hotkey)
-                            .err()
-                            .map(|e| format!("{e}"));
-                    }
-                    ui.label(egui::RichText::new("Ej: \\ , F8 , Alt+F10").weak().small());
-                });
-
-                if let Some(err) = &self.hotkey_error {
-                    ui.label(
-                        egui::RichText::new(err).color(egui::Color32::from_rgb(248, 113, 113)),
-                    );
-                }
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.cfg.capture_cursor, "Capturar cursor");
-                    ui.checkbox(&mut self.cfg.sound_feedback, "Sonido al guardar clip");
-                    ui.checkbox(&mut self.cfg.auto_update, "Actualizar automáticamente");
-                });
-                ui.checkbox(
-                    &mut self.start_with_windows,
-                    "Iniciar Bals automáticamente con Windows (en bandeja)",
-                );
-            });
-
-            ui.add_space(8.0);
-
-            // 3. Audio + Medidores VU en tiempo real
-            ui.group(|ui| {
-                ui.strong("Audio (WASAPI 48 kHz AAC-LC)");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Audio a grabar:");
-                    ui.selectable_value(
-                        &mut self.cfg.audio_capture_mode,
-                        AudioCaptureMode::FullDesktop,
-                        "Todo el escritorio (juego + Discord + música)",
-                    );
-                    ui.selectable_value(
-                        &mut self.cfg.audio_capture_mode,
-                        AudioCaptureMode::GameOnly,
-                        "Solo el juego detectado",
-                    );
-                });
-
-                ui.add_space(6.0);
-
-                // Juego / Escritorio + barra VU en vivo
-                let desktop_lvl = (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
-                ui.horizontal(|ui| {
-                    ui.label("Juego / Escritorio:");
-                    let mut pct = (self.cfg.game_volume * 100.0).round();
-                    if ui
-                        .add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%"))
-                        .changed()
-                    {
-                        self.cfg.game_volume = pct / 100.0;
-                    }
-                });
-                draw_vu_meter(ui, desktop_lvl, "Nivel juego / escritorio");
-
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut self.cfg.mic_enabled,
-                    "Grabar micrófono mezclado con el audio",
-                );
-
-                let mic_lvl = if self.cfg.mic_enabled {
-                    (self.audio_meter.mic_level() * self.cfg.mic_volume).min(1.0)
-                } else {
-                    0.0
-                };
-                ui.add_enabled_ui(self.cfg.mic_enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Micrófono:         ");
-                        let mut pct = (self.cfg.mic_volume * 100.0).round();
-                        if ui
-                            .add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%"))
-                            .changed()
-                        {
-                            self.cfg.mic_volume = pct / 100.0;
-                        }
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(
+                            egui::RichText::new("BALS")
+                                .strong()
+                                .size(19.0)
+                                .color(p.chassis_text),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("CRT-60 v{CURRENT_VERSION}"))
+                                .size(10.0)
+                                .color(p.chassis_muted),
+                        );
                     });
-                    draw_vu_meter(ui, mic_lvl, "Nivel micrófono");
-                });
 
-                // Refrescar ~30 veces por segundo mientras el usuario mira los niveles de audio.
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(33));
-            });
+                    ui.add_space(10.0);
 
-            ui.add_space(8.0);
-
-            // 4. Carpeta y juegos extra
-            ui.group(|ui| {
-                ui.strong("Carpeta de clips y Juegos en modo ventana");
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Carpeta:");
-                    let mut dir_str = self.cfg.clips_dir.to_string_lossy().into_owned();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut dir_str).desired_width(420.0))
-                        .changed()
+                    // Pestañas físicas estilo gatillo consola [L1] / [R1]
+                    if hardware_tab_button(ui, &p, self.tab == Tab::Settings, "L1", "AJUSTES")
+                        .clicked()
                     {
-                        self.cfg.clips_dir = PathBuf::from(dir_str);
+                        self.tab = Tab::Settings;
                     }
-                    if ui.button("📂 Abrir").clicked() {
-                        let _ = std::fs::create_dir_all(&self.cfg.clips_dir);
-                        open_in_shell(&self.cfg.clips_dir);
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Juegos extra (.exe):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.extra_games_text)
-                            .hint_text("ej: javaw.exe, valorant.exe")
-                            .desired_width(420.0),
-                    );
-                });
-            });
-
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                let save_btn = egui::Button::new(
-                    egui::RichText::new("💾 Guardar y aplicar cambios").strong(),
-                )
-                .fill(egui::Color32::from_rgb(16, 185, 129));
-                if ui.add_sized([220.0, 32.0], save_btn).clicked() {
-                    self.save_config();
-                }
-                if ui.button("🔄 Buscar actualizaciones").clicked() {
-                    self.check_for_updates();
-                }
-
-                // Estado del auto-updater
-                let mut pending_install: Option<ReleaseInfo> = None;
-                if let Ok(st) = self.update_state.lock() {
-                    match &*st {
-                        UpdateUiState::Idle => {}
-                        UpdateUiState::Checking => {
-                            ui.label("Comprobando...");
-                            ui.ctx()
-                                .request_repaint_after(std::time::Duration::from_millis(120));
-                        }
-                        UpdateUiState::UpToDate => {
-                            ui.label(
-                                egui::RichText::new(format!("✓ Estás en la última versión (v{CURRENT_VERSION})"))
-                                    .color(egui::Color32::from_rgb(52, 211, 153)),
-                            );
-                        }
-                        UpdateUiState::Available(info) => {
-                            if ui
-                                .button(format!("⬇ Instalar v{}", info.version))
-                                .clicked()
-                            {
-                                pending_install = Some(info.clone());
-                            }
-                        }
-                        UpdateUiState::Downloading => {
-                            ui.label("Descargando actualización...");
-                            ui.ctx()
-                                .request_repaint_after(std::time::Duration::from_millis(120));
-                        }
-                        UpdateUiState::Error(e) => {
-                            ui.label(
-                                egui::RichText::new(format!("Error: {e}"))
-                                    .small()
-                                    .color(egui::Color32::from_rgb(248, 113, 113)),
-                            );
-                        }
-                    }
-                }
-                if let Some(info) = pending_install {
-                    self.install_update(info);
-                }
-            });
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    "Al cerrar esta ventana, Bals sigue en tu bandeja del sistema liberando toda la memoria de la interfaz.",
-                )
-                .small()
-                .weak(),
-            );
-        });
-    }
-
-    fn render_clips_tab(&mut self, ui: &mut egui::Ui, trim_in_progress: bool) {
-        ui.columns(2, |cols| {
-            // Columna izquierda: lista de clips
-            cols[0].horizontal(|ui| {
-                ui.strong("Tus clips");
-                if ui.button("🔄 Actualizar").clicked() {
-                    self.refresh_clips();
-                }
-                if ui.button("📂 Carpeta").clicked() {
-                    let _ = std::fs::create_dir_all(&self.cfg.clips_dir);
-                    open_in_shell(&self.cfg.clips_dir);
-                }
-            });
-            cols[0].separator();
-
-            if self.clips.is_empty() {
-                cols[0].add_space(12.0);
-                cols[0].label(
-                    egui::RichText::new(format!(
-                        "Aún no hay clips en:\n{}",
-                        self.cfg.clips_dir.display()
-                    ))
-                    .weak(),
-                );
-            } else {
-                let mut clicked_path: Option<PathBuf> = None;
-                egui::ScrollArea::vertical().show(&mut cols[0], |ui| {
-                    for clip in &self.clips {
-                        let is_selected = self.selected_clip.as_ref() == Some(&clip.path);
-                        let label = format!("🎬 {}  ({:.1} MB)", clip.name, clip.size_mb);
-                        if ui.selectable_label(is_selected, label).clicked() {
-                            clicked_path = Some(clip.path.clone());
-                        }
-                    }
-                });
-                if let Some(p) = clicked_path {
-                    self.select_clip(p);
-                }
-            }
-
-            // Columna derecha: acciones y recortador sin pérdida
-            cols[1].strong("Recortador sin pérdida (Passthrough MP4)");
-            cols[1].separator();
-
-            let Some(sel_path) = self.selected_clip.clone() else {
-                cols[1].add_space(12.0);
-                cols[1].label(egui::RichText::new("Selecciona un clip de la lista para reproducirlo o recortarlo.").weak());
-                return;
-            };
-
-            let name = sel_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            cols[1].label(egui::RichText::new(name).strong());
-
-            cols[1].add_space(6.0);
-            cols[1].horizontal(|ui| {
-                if ui.button("▶ Reproducir").clicked() {
-                    open_in_shell(&sel_path);
-                }
-                if ui.button("🗑 Eliminar").clicked() {
-                    if std::fs::remove_file(&sel_path).is_ok() {
-                        self.banner_msg = Some(("Clip eliminado.".into(), false));
+                    let clips_lbl = format!("CLIPS & DECK ({})", self.clips.len());
+                    if hardware_tab_button(ui, &p, self.tab == Tab::Clips, "R1", &clips_lbl)
+                        .clicked()
+                    {
+                        self.tab = Tab::Clips;
                         self.refresh_clips();
                     }
-                }
-            });
 
-            cols[1].add_space(12.0);
-
-            let Some(total_dur) = self.selected_duration else {
-                cols[1].label("No se pudo leer la duración del archivo.");
-                return;
-            };
-
-            cols[1].group(|ui| {
-                ui.label(format!("Duración original: {:.2} s", total_dur));
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Inicio (s):");
-                    ui.add(
-                        egui::Slider::new(&mut self.trim_start, 0.0..=(total_dur - 0.5).max(0.0))
-                            .fixed_decimals(1),
-                    );
-                });
-                if self.trim_end <= self.trim_start + 0.5 {
-                    self.trim_end = (self.trim_start + 0.5).min(total_dur);
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Fin (s):   ");
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.trim_end,
-                            (self.trim_start + 0.5).min(total_dur)..=total_dur,
-                        )
-                        .fixed_decimals(1),
-                    );
-                });
-
-                // Barra visual simple del rango seleccionado
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(45));
-                if total_dur > 0.0 {
-                    let x0 = rect.left() + rect.width() * (self.trim_start / total_dur) as f32;
-                    let x1 = rect.left() + rect.width() * (self.trim_end / total_dur) as f32;
-                    let sel_rect = egui::Rect::from_min_max(
-                        egui::pos2(x0, rect.top()),
-                        egui::pos2(x1.max(x0 + 2.0), rect.bottom()),
-                    );
-                    painter.rect_filled(sel_rect, 4.0, egui::Color32::from_rgb(16, 185, 129));
-                }
-
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Duración resultante: {:.1} s (corte instantáneo alineado al keyframe más cercano)",
-                        (self.trim_end - self.trim_start).max(0.0)
-                    ))
-                    .small()
-                    .weak(),
-                );
-
-                ui.add_space(8.0);
-                ui.add_enabled_ui(!trim_in_progress, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        let trim_label = if trim_in_progress {
-                            "Procesando..."
+                    // Lado derecho: LCD de telemetría en vivo + botones físicos + LED power
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // LED verde físico de encendido
+                        let (led_rect, led_resp) =
+                            ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                        draw_status_led(
+                            ui.painter(),
+                            led_rect.center(),
+                            4.5,
+                            p.led_green,
+                            self.daemon_running,
+                            0.4,
+                        );
+                        led_resp.on_hover_text(if self.daemon_running {
+                            "Daemon activo en bandeja"
                         } else {
-                            "✂ Recortar sin pérdida"
-                        };
-                        if ui.button(trim_label).clicked() {
-                            self.start_trim();
-                        }
-                        if ui
-                            .button("📦 Comprimir <10 MB (Discord)")
-                            .on_hover_text("Recodifica el rango seleccionado usando tu GPU para quedar por debajo de 10 MB")
+                            "Daemon detenido"
+                        });
+
+                        if self.daemon_running {
+                            let is_rec = self
+                                .telemetry
+                                .as_ref()
+                                .is_some_and(|t| t.state != TelemetryState::Idle);
+                            let rec_lbl = if is_rec { "⏸ PAUSA" } else { "▶ REC" };
+                            if hardware_action_button(
+                                ui,
+                                &p,
+                                rec_lbl,
+                                p.chassis_btn_bg,
+                                p.chassis_text,
+                                30.0,
+                            )
+                            .on_hover_text("Iniciar o pausar Replay Buffer manual (F5)")
                             .clicked()
-                        {
-                            self.start_compress(9.5, "discord");
-                        }
-                        if ui
-                            .button("📦 Comprimir <25 MB")
-                            .on_hover_text("Recodifica el rango seleccionado usando tu GPU para quedar por debajo de 25 MB")
+                            {
+                                ipc::notify_toggle_record();
+                                self.set_banner("Estado de grabación alternado.", false);
+                            }
+
+                            let clip_btn_lbl = format!("[{}] CLIP", self.cfg.save_clip_hotkey);
+                            if hardware_action_button(
+                                ui,
+                                &p,
+                                &clip_btn_lbl,
+                                p.danger,
+                                p.danger_text,
+                                30.0,
+                            )
+                            .on_hover_text("Guardar los últimos segundos del Replay Buffer")
                             .clicked()
-                        {
-                            self.start_compress(24.0, "25mb");
+                            {
+                                ipc::notify_save_clip();
+                                self.set_banner("Solicitud de clip enviada al motor.", false);
+                            }
                         }
+
+                        // Pantalla LCD empotrada con telemetría en tiempo real
+                        draw_live_telemetry_lcd(ui, &p, self.daemon_running, &self.telemetry, rec_pulse);
                     });
                 });
             });
-        });
+
+        // =========================================================================
+        // 2. BISEL INFERIOR DE CARCASA HARDWARE CRT (Opción C + Leyenda Consola A)
+        // =========================================================================
+        let bottom_frame = egui::Frame::new()
+            .fill(p.chassis_bg)
+            .inner_margin(egui::Margin::symmetric(14, 8))
+            .stroke(Stroke::new(1.5, p.chassis_outline));
+
+        egui::Panel::bottom("bals_crt_bottom_bezel")
+            .frame(bottom_frame)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Rejillas físicas de ventilación a la izquierda
+                    draw_vent_grille(ui, &p, 56.0, 22.0);
+                    ui.add_space(6.0);
+
+                    // Si hay una notificación activa, mostrarla en un visor LCD; si no, mostrar mini-VU en vivo
+                    if let Some((msg, is_err, _)) = &self.banner_msg {
+                        let (brect, _) = ui.allocate_exact_size(vec2(380.0, 24.0), Sense::hover());
+                        ui.painter().rect_filled(brect, 3.0, p.crt_recess);
+                        let col = if *is_err { p.led_red } else { p.accent_bright };
+                        ui.painter().rect_stroke(
+                            brect,
+                            3.0,
+                            Stroke::new(1.2, col),
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            pos2(brect.left() + 8.0, brect.center().y),
+                            Align2::LEFT_CENTER,
+                            msg,
+                            FontId::monospace(11.0),
+                            col,
+                        );
+                    } else {
+                        let g_lvl =
+                            (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
+                        let m_lvl = if self.cfg.mic_enabled {
+                            (self.audio_meter.mic_level() * self.cfg.mic_volume).min(1.0)
+                        } else {
+                            0.0
+                        };
+                        draw_mini_bezel_vu(ui, &p, g_lvl, m_lvl, self.cfg.mic_enabled);
+
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("[Q/E] PESTAÑAS · [CTRL+S] APLICAR · [F5] REC")
+                                .size(10.5)
+                                .color(p.chassis_muted),
+                        );
+                    }
+
+                    // Badge derecho: estado de GPU / Encoder
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let enc_text = self
+                            .telemetry
+                            .as_ref()
+                            .filter(|_| self.daemon_running)
+                            .map(|t| t.encoder_label.as_str())
+                            .unwrap_or("MOTOR DETENIDO");
+                        let badge_w = (enc_text.chars().count() as f32 * 6.8 + 26.0).max(125.0);
+                        let (erect, _) =
+                            ui.allocate_exact_size(vec2(badge_w, 24.0), Sense::hover());
+                        ui.painter().rect_filled(erect, 3.0, p.crt_recess);
+                        ui.painter().rect_stroke(
+                            erect,
+                            3.0,
+                            Stroke::new(1.2, p.chassis_outline),
+                            StrokeKind::Inside,
+                        );
+                        draw_status_led(
+                            ui.painter(),
+                            pos2(erect.left() + 11.0, erect.center().y),
+                            3.2,
+                            if self.daemon_running {
+                                p.led_green
+                            } else {
+                                p.led_red
+                            },
+                            true,
+                            0.2,
+                        );
+                        ui.painter().text(
+                            pos2(erect.left() + 21.0, erect.center().y),
+                            Align2::LEFT_CENTER,
+                            enc_text,
+                            FontId::monospace(10.5),
+                            p.crt_text,
+                        );
+                    });
+                });
+            });
+
+        // =========================================================================
+        // 3. PANTALLA CRT EMPOTRADA CENTRAL (Contorno Chasis + Vidrio CRT + Scanlines)
+        // =========================================================================
+        let outer_center_frame = egui::Frame::new()
+            .fill(p.chassis_bg)
+            .inner_margin(egui::Margin::symmetric(14, 6));
+
+        egui::CentralPanel::default()
+            .frame(outer_center_frame)
+            .show(ui, |ui| {
+                let crt_rect = ui.available_rect_before_wrap();
+                draw_crt_recess(ui.painter(), crt_rect, &p);
+
+                let inner_frame = egui::Frame::new()
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin::same(12));
+
+                inner_frame.show(ui, |ui| {
+                    match self.tab {
+                        Tab::Settings => settings_view::render_settings_tab(self, ui, &p),
+                        Tab::Clips => {
+                            clips_view::render_clips_tab(self, ui, &p, trim_in_progress)
+                        }
+                    }
+                });
+
+                // Scanlines CRT sutiles encima de la pantalla interior (opcional)
+                if self.cfg.crt_scanlines {
+                    draw_scanlines(ui.painter(), crt_rect.shrink(4.0), p.crt_scanline);
+                }
+            });
     }
 }
 
-fn draw_vu_meter(ui: &mut egui::Ui, level: f32, tooltip: &str) {
-    let desired = egui::vec2(ui.available_width().min(420.0), 10.0);
-    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+/// Dibuja el visor LCD oscuro empotrado en el bisel superior con estado en vivo del motor.
+fn draw_live_telemetry_lcd(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    daemon_running: bool,
+    telemetry: &Option<EngineTelemetrySnapshot>,
+    rec_pulse: f32,
+) {
+    let (label, led_color, is_rec) = if !daemon_running {
+        ("MOTOR DETENIDO".to_string(), p.led_red, false)
+    } else if let Some(t) = telemetry {
+        match t.state {
+            TelemetryState::Idle => ("STANDBY · 0% GPU".to_string(), p.led_green, false),
+            TelemetryState::RecordingManual => (
+                format!(
+                    "REC {:.0}s/{}s · {:.0}MB",
+                    t.buffered_secs, t.replay_target_secs, t.buffer_ram_mb
+                ),
+                p.led_red,
+                true,
+            ),
+            TelemetryState::RecordingGame => {
+                let g = if t.game_name.len() > 12 {
+                    &t.game_name[..12]
+                } else {
+                    &t.game_name
+                };
+                (
+                    format!("{g} {:.0}s · {:.0}MB", t.buffered_secs, t.buffer_ram_mb),
+                    p.led_red,
+                    true,
+                )
+            }
+            TelemetryState::PausedAltTab => (
+                format!("ALT-TAB {:.0}s · HOLD", t.buffered_secs),
+                p.amber,
+                false,
+            ),
+        }
+    } else {
+        ("STANDBY · 0% GPU".to_string(), p.led_green, false)
+    };
+
+    let width = (label.chars().count() as f32 * 6.9 + 28.0).clamp(142.0, 218.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 30.0), Sense::hover());
     let painter = ui.painter();
 
-    // Fondo oscuro de la barra
-    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(35));
+    painter.rect_filled(rect, 3.0, p.crt_recess);
+    painter.rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.5, p.chassis_outline),
+        StrokeKind::Inside,
+    );
 
-    let clamped = level.clamp(0.0, 1.0);
-    if clamped > 0.005 {
-        let fill_w = rect.width() * clamped;
-        let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
-        let color = if clamped > 0.88 {
-            egui::Color32::from_rgb(239, 68, 68) // rojo (saturación)
-        } else if clamped > 0.65 {
-            egui::Color32::from_rgb(245, 158, 11) // ámbar (alto)
-        } else {
-            egui::Color32::from_rgb(16, 185, 129) // verde esmeralda (óptimo)
-        };
-        painter.rect_filled(fill_rect, 3.0, color);
+    draw_status_led(
+        painter,
+        pos2(rect.left() + 12.0, rect.center().y),
+        3.6,
+        led_color,
+        true,
+        if is_rec { rec_pulse } else { 0.15 },
+    );
+    painter.text(
+        pos2(rect.left() + 23.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::monospace(11.0),
+        if is_rec { p.led_red } else { p.crt_text },
+    );
+}
+
+fn egui_key_to_hotkey_spec(key: egui::Key, mods: egui::Modifiers) -> Option<String> {
+    let base = match key {
+        egui::Key::F1 => "F1",
+        egui::Key::F2 => "F2",
+        egui::Key::F3 => "F3",
+        egui::Key::F4 => "F4",
+        egui::Key::F5 => "F5",
+        egui::Key::F6 => "F6",
+        egui::Key::F7 => "F7",
+        egui::Key::F8 => "F8",
+        egui::Key::F9 => "F9",
+        egui::Key::F10 => "F10",
+        egui::Key::F11 => "F11",
+        egui::Key::F12 => "F12",
+        egui::Key::F13 => "F13",
+        egui::Key::F14 => "F14",
+        egui::Key::F15 => "F15",
+        egui::Key::F16 => "F16",
+        egui::Key::F17 => "F17",
+        egui::Key::F18 => "F18",
+        egui::Key::F19 => "F19",
+        egui::Key::F20 => "F20",
+        egui::Key::Backslash => "\\",
+        egui::Key::Slash => "/",
+        egui::Key::Minus => "-",
+        egui::Key::Equals => "=",
+        egui::Key::OpenBracket => "[",
+        egui::Key::CloseBracket => "]",
+        egui::Key::Backtick => "`",
+        egui::Key::Insert => "Insert",
+        egui::Key::Home => "Home",
+        egui::Key::End => "End",
+        egui::Key::PageUp => "PgUp",
+        egui::Key::PageDown => "PgDn",
+        egui::Key::A => "A",
+        egui::Key::B => "B",
+        egui::Key::C => "C",
+        egui::Key::D => "D",
+        egui::Key::E => "E",
+        egui::Key::F => "F",
+        egui::Key::G => "G",
+        egui::Key::H => "H",
+        egui::Key::I => "I",
+        egui::Key::J => "J",
+        egui::Key::K => "K",
+        egui::Key::L => "L",
+        egui::Key::M => "M",
+        egui::Key::N => "N",
+        egui::Key::O => "O",
+        egui::Key::P => "P",
+        egui::Key::Q => "Q",
+        egui::Key::R => "R",
+        egui::Key::S => "S",
+        egui::Key::T => "T",
+        egui::Key::U => "U",
+        egui::Key::V => "V",
+        egui::Key::W => "W",
+        egui::Key::X => "X",
+        egui::Key::Y => "Y",
+        egui::Key::Z => "Z",
+        egui::Key::Num0 => "0",
+        egui::Key::Num1 => "1",
+        egui::Key::Num2 => "2",
+        egui::Key::Num3 => "3",
+        egui::Key::Num4 => "4",
+        egui::Key::Num5 => "5",
+        egui::Key::Num6 => "6",
+        egui::Key::Num7 => "7",
+        egui::Key::Num8 => "8",
+        egui::Key::Num9 => "9",
+        _ => return None,
+    };
+
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+    if mods.ctrl {
+        parts.push("Ctrl");
     }
-
-    // Marcas de referencia sutiles (50% y 85%)
-    let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(65));
-    for frac in [0.50f32, 0.85f32] {
-        let x = rect.left() + rect.width() * frac;
-        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+    if mods.alt {
+        parts.push("Alt");
     }
-
-    response.on_hover_text(format!("{tooltip}: {:.0}%", clamped * 100.0));
+    if mods.shift {
+        parts.push("Shift");
+    }
+    parts.push(base);
+    Some(parts.join("+"))
 }
 
 fn scan_clips(dir: &Path) -> Vec<ClipEntry> {
@@ -904,7 +1057,7 @@ fn scan_clips(dir: &Path) -> Vec<ClipEntry> {
     clips
 }
 
-fn open_in_shell(path: &Path) {
+pub(crate) fn open_in_shell(path: &Path) {
     let target = HSTRING::from(path.as_os_str());
     unsafe {
         ShellExecuteW(
