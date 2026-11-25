@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use eframe::egui::{self, Sense, Stroke, StrokeKind, vec2};
 
 use crate::config::{
-    AudioCaptureMode, CaptureMode, FrameRate, QualityPreset, ReplayDuration, Resolution, UiTheme,
-    VideoConfig,
+    AudioCaptureMode, CaptureMode, EncoderPreference, FrameRate, QualityPreset, ReplayDuration,
+    Resolution, UiTheme, VideoConfig,
 };
 use crate::hotkey::parse_hotkey;
 use crate::ui::theme::RetroPalette;
@@ -42,54 +42,55 @@ pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPale
 }
 
 fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
+    let hw_badge = app
+        .detected_encoders
+        .hw_short
+        .as_deref()
+        .map(|s| format!("H.264 · {s}"))
+        .unwrap_or_else(|| "H.264 SW".to_string());
+
     retro_card(
         ui,
         p,
         "VIDEO // ZERO-COPY GPU",
-        Some("H.264 HW"),
+        Some(&hw_badge),
         |ui| {
             let row_w = ui.available_width();
 
             // Resolución (3 píldoras en fila)
-            ui.label(egui::RichText::new("RESOLUCIÓN").size(10.5).color(p.crt_muted));
+            ui.label(egui::RichText::new("RESOLUCIÓN").size(10.0).color(p.crt_muted));
             let w3 = ((row_w - 14.0) / 3.0).max(70.0);
             ui.horizontal(|ui| {
-                if retro_pill(ui, p, app.cfg.resolution == Resolution::P720, "720p", vec2(w3, 25.0)).clicked() {
+                if retro_pill(ui, p, app.cfg.resolution == Resolution::P720, "720p", vec2(w3, 23.0)).clicked() {
                     app.cfg.resolution = Resolution::P720;
                 }
-                if retro_pill(ui, p, app.cfg.resolution == Resolution::P1080, "1080p", vec2(w3, 25.0)).clicked() {
+                if retro_pill(ui, p, app.cfg.resolution == Resolution::P1080, "1080p", vec2(w3, 23.0)).clicked() {
                     app.cfg.resolution = Resolution::P1080;
                 }
-                if retro_pill(ui, p, app.cfg.resolution == Resolution::P1440, "2K", vec2(w3, 25.0)).clicked() {
+                if retro_pill(ui, p, app.cfg.resolution == Resolution::P1440, "2K", vec2(w3, 23.0)).clicked() {
                     app.cfg.resolution = Resolution::P1440;
                 }
             });
 
-            ui.add_space(4.0);
-
-            // FPS (2 píldoras)
-            ui.label(egui::RichText::new("CUADROS POR SEGUNDO").size(10.5).color(p.crt_muted));
-            let w2 = ((row_w - 7.0) / 2.0).max(95.0);
+            // FPS (2 píldoras) + Calidad (3 píldoras)
+            ui.label(egui::RichText::new("FPS Y CALIDAD").size(10.0).color(p.crt_muted));
+            let w_fps = ((row_w - 7.0) * 0.36).max(115.0);
+            let w_fps_btn = ((w_fps - 5.0) / 2.0).max(52.0);
+            let w_qual = ((row_w - w_fps - 18.0) / 3.0).max(60.0);
             ui.horizontal(|ui| {
-                if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps30, "30 FPS", vec2(w2, 25.0)).clicked() {
+                if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps30, "30 FPS", vec2(w_fps_btn, 23.0)).clicked() {
                     app.cfg.fps = FrameRate::Fps30;
                 }
-                if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps60, "60 FPS", vec2(w2, 25.0)).clicked() {
+                if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps60, "60 FPS", vec2(w_fps_btn, 23.0)).clicked() {
                     app.cfg.fps = FrameRate::Fps60;
                 }
-            });
-
-            ui.add_space(4.0);
-
-            // Calidad / Peso (3 píldoras)
-            ui.label(egui::RichText::new("CALIDAD / COMPRESIÓN").size(10.5).color(p.crt_muted));
-            ui.horizontal(|ui| {
+                ui.add_space(4.0);
                 if retro_pill(
                     ui,
                     p,
                     app.cfg.quality == QualityPreset::Compact,
                     "AHORRO",
-                    vec2(w3, 25.0),
+                    vec2(w_qual, 23.0),
                 )
                 .on_hover_text("~45% menos peso y RAM")
                 .clicked()
@@ -101,7 +102,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     p,
                     app.cfg.quality == QualityPreset::Balanced,
                     "NORMAL",
-                    vec2(w3, 25.0),
+                    vec2(w_qual, 23.0),
                 )
                 .clicked()
                 {
@@ -112,7 +113,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     p,
                     app.cfg.quality == QualityPreset::High,
                     "ALTA",
-                    vec2(w3, 25.0),
+                    vec2(w_qual, 23.0),
                 )
                 .clicked()
                 {
@@ -120,10 +121,70 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            ui.add_space(4.0);
+            // Selector de Encoder / Codec (Auto GPU / Hardware GPU detectada / CPU Software)
+            ui.label(egui::RichText::new("ENCODER / CODEC H.264").size(10.0).color(p.crt_muted));
+            let gpu_pill_label = app
+                .detected_encoders
+                .hw_short
+                .as_deref()
+                .map(|s| format!("GPU ({s})"))
+                .unwrap_or_else(|| "GPU (HW)".to_string());
+            let hw_hover = app
+                .detected_encoders
+                .hw_name
+                .as_deref()
+                .map(|n| format!("Codificación por hardware en tu gráfica: {n}"))
+                .unwrap_or_else(|| "No se detectó encoder H.264 por hardware".to_string());
+            let sw_hover = app
+                .detected_encoders
+                .sw_name
+                .as_deref()
+                .map(|n| format!("Codificación por CPU (software): {n}"))
+                .unwrap_or_else(|| "Codificación por CPU (Microsoft H.264 MFT)".to_string());
+
+            ui.horizontal(|ui| {
+                if retro_pill(
+                    ui,
+                    p,
+                    app.cfg.encoder_pref == EncoderPreference::AutoGpu,
+                    "AUTO (GPU)",
+                    vec2(w3, 23.0),
+                )
+                .on_hover_text("Usa tu gráfica automáticamente (fallback a CPU si falla)")
+                .clicked()
+                {
+                    app.cfg.encoder_pref = EncoderPreference::AutoGpu;
+                }
+                ui.add_enabled_ui(app.detected_encoders.hw_name.is_some(), |ui| {
+                    if retro_pill(
+                        ui,
+                        p,
+                        app.cfg.encoder_pref == EncoderPreference::HardwareGpu,
+                        &gpu_pill_label,
+                        vec2(w3, 23.0),
+                    )
+                    .on_hover_text(&hw_hover)
+                    .clicked()
+                    {
+                        app.cfg.encoder_pref = EncoderPreference::HardwareGpu;
+                    }
+                });
+                if retro_pill(
+                    ui,
+                    p,
+                    app.cfg.encoder_pref == EncoderPreference::SoftwareCpu,
+                    "CPU (SW)",
+                    vec2(w3, 23.0),
+                )
+                .on_hover_text(&sw_hover)
+                .clicked()
+                {
+                    app.cfg.encoder_pref = EncoderPreference::SoftwareCpu;
+                }
+            });
 
             // Duración del Replay Buffer (4 píldoras)
-            ui.label(egui::RichText::new("REPLAY BUFFER EN RAM").size(10.5).color(p.crt_muted));
+            ui.label(egui::RichText::new("REPLAY BUFFER EN RAM").size(10.0).color(p.crt_muted));
             let w4 = ((row_w - 21.0) / 4.0).max(52.0);
             ui.horizontal(|ui| {
                 for (dur, lbl) in [
@@ -132,13 +193,13 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     (ReplayDuration::Sec60, "60s"),
                     (ReplayDuration::Sec120, "120s"),
                 ] {
-                    if retro_pill(ui, p, app.cfg.replay_duration == dur, lbl, vec2(w4, 25.0)).clicked() {
+                    if retro_pill(ui, p, app.cfg.replay_duration == dur, lbl, vec2(w4, 23.0)).clicked() {
                         app.cfg.replay_duration = dur;
                     }
                 }
             });
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             let bitrate_bps = VideoConfig::recommended_bitrate_for(
                 app.cfg.resolution,
                 app.cfg.fps,
@@ -152,7 +213,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     bitrate_bps as f64 / 1_000_000.0,
                     est_ram_mb
                 ))
-                .size(11.0)
+                .size(10.8)
                 .color(p.accent),
             );
         },
@@ -200,7 +261,6 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
             ui.add_space(6.0);
 
             // Volumen Juego / Escritorio + VU LED segmentado
-            let desktop_lvl = (app.audio_meter.desktop_level() * app.cfg.game_volume).min(1.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("JUEGO / PC").size(11.5).color(p.crt_text));
                 let mut pct = (app.cfg.game_volume * 100.0).round();
@@ -218,8 +278,7 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
             draw_led_vu_meter(
                 ui,
                 p,
-                desktop_lvl,
-                app.desktop_peak_hold,
+                app.desktop_vu_display,
                 24,
                 14.0,
                 "Nivel juego / escritorio",
@@ -228,12 +287,6 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
             ui.add_space(8.0);
 
             retro_checkbox(ui, p, &mut app.cfg.mic_enabled, "MEZCLAR MICRÓFONO");
-
-            let mic_lvl = if app.cfg.mic_enabled {
-                (app.audio_meter.mic_level() * app.cfg.mic_volume).min(1.0)
-            } else {
-                0.0
-            };
 
             ui.add_enabled_ui(app.cfg.mic_enabled, |ui| {
                 ui.horizontal(|ui| {
@@ -253,9 +306,8 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 draw_led_vu_meter(
                     ui,
                     p,
-                    mic_lvl,
                     if app.cfg.mic_enabled {
-                        app.mic_peak_hold
+                        app.mic_vu_display
                     } else {
                         0.0
                     },

@@ -13,7 +13,7 @@ pub fn render_clips_tab(
     app: &mut BalsUiApp,
     ui: &mut egui::Ui,
     p: &RetroPalette,
-    trim_in_progress: bool,
+    running_op: Option<&str>,
 ) {
     let total_w = ui.available_width();
     let left_w = (total_w * 0.39).clamp(240.0, 340.0);
@@ -37,7 +37,7 @@ pub fn render_clips_tab(
             vec2(right_w, avail_h),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                render_crt_deck(app, ui, p, trim_in_progress);
+                render_crt_deck(app, ui, p, running_op);
             },
         );
     });
@@ -189,7 +189,7 @@ fn render_crt_deck(
     app: &mut BalsUiApp,
     ui: &mut egui::Ui,
     p: &RetroPalette,
-    trim_in_progress: bool,
+    running_op: Option<&str>,
 ) {
     let meta_badge = app.selected_metadata.map(|m| {
         if m.width > 0 && m.fps > 0.0 {
@@ -359,6 +359,7 @@ fn render_crt_deck(
             ui.add_space(8.0);
 
             // 3. Botonera física Deck (Play, Recorte Passthrough, Discord <10MB, <25MB, Copiar, Eliminar)
+            let trim_in_progress = running_op.is_some();
             ui.add_enabled_ui(!trim_in_progress, |ui| {
                 let row_w = ui.available_width();
                 ui.horizontal(|ui| {
@@ -370,11 +371,7 @@ fn render_crt_deck(
                     }
 
                     let trim_w = (row_w - 190.0).max(150.0);
-                    let trim_lbl = if trim_in_progress {
-                        "PROCESANDO..."
-                    } else {
-                        "RECORTAR SIN PÉRDIDA"
-                    };
+                    let trim_lbl = running_op.unwrap_or("RECORTAR SIN PÉRDIDA");
                     if retro_pill(ui, p, true, trim_lbl, vec2(trim_w, 30.0))
                         .on_hover_text("Corte instantáneo MP4 passthrough sin recodificar")
                         .clicked()

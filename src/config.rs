@@ -111,6 +111,34 @@ impl fmt::Display for QualityPreset {
     }
 }
 
+/// Preferencia de encoder de video H.264.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EncoderPreference {
+    /// Automático: prioriza GPU por hardware (AMD AMF / NVIDIA NVENC / Intel QSV), con fallback a CPU.
+    #[default]
+    AutoGpu,
+    /// Usa exclusivamente el encoder por Hardware de tu GPU (AMD AMF / NVIDIA NVENC / Intel QSV).
+    HardwareGpu,
+    /// Usa el encoder H.264 por Software en CPU (útil para diagnóstico o bitrate CBR muy estricto).
+    SoftwareCpu,
+}
+
+impl EncoderPreference {
+    pub const fn label(self) -> &'static str {
+        match self {
+            EncoderPreference::AutoGpu => "AUTO (GPU)",
+            EncoderPreference::HardwareGpu => "GPU (HW)",
+            EncoderPreference::SoftwareCpu => "CPU (SW)",
+        }
+    }
+}
+
+impl fmt::Display for EncoderPreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
 /// Configuración de video del encoder H.264.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoConfig {
@@ -120,6 +148,8 @@ pub struct VideoConfig {
     pub bitrate_bps: u32,
     /// Intervalo de keyframes (IDR) en segundos (2 s es ideal para replay buffer).
     pub gop_secs: u32,
+    /// Preferencia de encoder (Auto GPU / Solo GPU / CPU Software).
+    pub encoder_pref: EncoderPreference,
 }
 
 impl VideoConfig {
@@ -132,12 +162,22 @@ impl VideoConfig {
         fps: FrameRate,
         quality: QualityPreset,
     ) -> Self {
+        Self::preset_full(resolution, fps, quality, EncoderPreference::AutoGpu)
+    }
+
+    pub const fn preset_full(
+        resolution: Resolution,
+        fps: FrameRate,
+        quality: QualityPreset,
+        encoder_pref: EncoderPreference,
+    ) -> Self {
         let bitrate_bps = Self::recommended_bitrate_for(resolution, fps, quality);
         Self {
             resolution,
             fps,
             bitrate_bps,
             gop_secs: 2,
+            encoder_pref,
         }
     }
 
@@ -301,6 +341,7 @@ pub struct AppConfig {
     pub resolution: Resolution,
     pub fps: FrameRate,
     pub quality: QualityPreset,
+    pub encoder_pref: EncoderPreference,
     pub replay_duration: ReplayDuration,
     /// Atajo global para guardar los últimos N segundos (por defecto `\`).
     pub save_clip_hotkey: String,
@@ -330,6 +371,7 @@ impl Default for AppConfig {
             resolution: Resolution::P1080,
             fps: FrameRate::Fps60,
             quality: QualityPreset::Balanced,
+            encoder_pref: EncoderPreference::AutoGpu,
             replay_duration: ReplayDuration::Sec30,
             save_clip_hotkey: "\\".to_string(),
             capture_mode: CaptureMode::AutoDetectGames,
@@ -351,7 +393,7 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn video_config(&self) -> VideoConfig {
-        VideoConfig::preset_with_quality(self.resolution, self.fps, self.quality)
+        VideoConfig::preset_full(self.resolution, self.fps, self.quality, self.encoder_pref)
     }
 
     pub fn audio_config(&self, source: AudioSource) -> AudioConfig {

@@ -3,30 +3,34 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tracing::info;
+use tracing::{info, warn};
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader,
-    MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE,
-    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_PD_DURATION,
-    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ANY_STREAM,
-    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_MEDIASOURCE,
-    MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFAudioFormat_AAC,
-    MFAudioFormat_PCM, MFCreateAttributes, MFCreateMediaType, MFCreateSinkWriterFromURL,
-    MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
+    CODECAPI_AVEncMPVGOPSize, ICodecAPI, IMFAttributes, IMFMediaBuffer, IMFMediaType, IMFSample,
+    IMFSinkWriter, IMFSourceReader, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION,
+    MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
+    MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
+    MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+    MF_SOURCE_READER_ANY_STREAM, MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
+    MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSCODE_CONTAINERTYPE,
+    MF_VERSION, MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMediaType,
+    MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video,
     MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
-    eAVEncH264VProfile_High,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::core::{GUID, HSTRING};
+use windows::Win32::System::Variant::VARIANT;
+use windows::core::{GUID, HSTRING, Interface};
 
 /// Resultado de un recorte o compresión de clip MP4.
 #[derive(Debug, Clone)]
 pub struct TrimStats {
     pub output_path: PathBuf,
+    pub input_bytes: u64,
     pub output_bytes: u64,
     pub duration_secs: f64,
     pub elapsed_ms: f64,
@@ -302,6 +306,7 @@ pub fn trim_mp4_passthrough(
         let _ = MFShutdown();
     }
 
+    let input_bytes = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
     let duration_secs = res?;
     let output_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -319,17 +324,17 @@ pub fn trim_mp4_passthrough(
 
     Ok(TrimStats {
         output_path: output_path.to_path_buf(),
+        input_bytes,
         output_bytes,
         duration_secs,
         elapsed_ms,
     })
 }
 
-/// Comprime un clip `.mp4` (o el rango `[start_secs, end_secs]`) usando la **GPU por hardware**
-/// vía Media Foundation para ajustarlo debajo de `target_mb` (ej. `9.5 MB` para Discord gratis).
-///
-/// Si el presupuesto de bitrate es ajustado para la resolución original (p. ej. 2K largo a <10 MB),
-/// reduce automáticamente la resolución a 1080p o 720p para mantener máxima nitidez sin artefactos.
+/// Comprime un clip `.mp4` (o el rango `[start_secs, end_secs]`) usando Media Foundation con
+/// **rate-control CBR estricto vía `ICodecAPI`** + reducción inteligente de FPS/resolución y
+/// **verificación automática del tamaño final**: si el driver GPU excede el límite, aplica
+/// automáticamente una pasada correctiva para garantizar quedar por debajo de `target_mb`.
 pub fn compress_mp4_to_target_mb(
     input_path: &Path,
     output_path: &Path,
@@ -347,14 +352,78 @@ pub fn compress_mp4_to_target_mb(
         std::fs::create_dir_all(parent)?;
     }
 
+    let input_bytes = std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0);
     let t0 = Instant::now();
     unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (compressor) falló")?;
-    let res = compress_inner(input_path, output_path, target_mb, start_secs, end_secs);
+
+    let target_bytes = (target_mb * 1024.0 * 1024.0) as u64;
+    let clip_dur = (end_secs - start_secs).max(0.5);
+    let audio_bps: u32 = if (target_mb * 8.0) / clip_dur < 1.3 {
+        64_000
+    } else {
+        96_000
+    };
+    let initial_video_bps = calc_target_video_bps(target_mb, clip_dur, audio_bps);
+
+    // Pasada 1: GPU Hardware con CBR explícito vía ICodecAPI.
+    let mut pass_res = compress_pass(
+        input_path,
+        output_path,
+        initial_video_bps,
+        audio_bps,
+        start_secs,
+        end_secs,
+        true,
+    );
+
+    // Si la pasada por hardware falló en este driver, reintentar directamente en software CBR.
+    if pass_res.is_err() {
+        warn!("Compresión por hardware falló; reintentando con encoder CBR por software");
+        pass_res = compress_pass(
+            input_path,
+            output_path,
+            initial_video_bps,
+            audio_bps,
+            start_secs,
+            end_secs,
+            false,
+        );
+    }
+
+    // Verificación estricta de tamaño: algunos drivers GPU (p. ej. AMD AMF a bitrates bajos)
+    // tienen un piso de bitrate interno y superan `target_mb`. Si excede el límite, ejecutamos
+    // una pasada correctiva con encoder CBR estricto en software para garantizar `< target_mb`.
+    if pass_res.is_ok() {
+        let actual_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        if actual_bytes > target_bytes {
+            let ratio = (target_bytes as f64 / actual_bytes as f64) * 0.86;
+            let corrected_bps = ((initial_video_bps as f64) * ratio)
+                .clamp(220_000.0, initial_video_bps as f64 * 0.90)
+                as u32;
+            warn!(
+                target_mb = format!("{target_mb:.1}"),
+                actual_mb = format!("{:.2}", actual_bytes as f64 / (1024.0 * 1024.0)),
+                corrected_kbps = corrected_bps / 1000,
+                "Pasada GPU excedió el límite de tamaño; aplicando pasada correctiva CBR estricta"
+            );
+            let _ = std::fs::remove_file(output_path);
+            pass_res = compress_pass(
+                input_path,
+                output_path,
+                corrected_bps,
+                audio_bps.min(96_000),
+                start_secs,
+                end_secs,
+                false,
+            );
+        }
+    }
+
     unsafe {
         let _ = MFShutdown();
     }
 
-    let duration_secs = res?;
+    let duration_secs = pass_res?;
     let output_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -365,23 +434,33 @@ pub fn compress_mp4_to_target_mb(
         actual_mb = format!("{:.2}", output_bytes as f64 / (1024.0 * 1024.0)),
         duration_secs = format!("{duration_secs:.2}"),
         elapsed_ms = format!("{elapsed_ms:.0}"),
-        "Clip MP4 comprimido por hardware (GPU)"
+        "Clip MP4 comprimido con verificación de tamaño"
     );
 
     Ok(TrimStats {
         output_path: output_path.to_path_buf(),
+        input_bytes,
         output_bytes,
         duration_secs,
         elapsed_ms,
     })
 }
 
-fn compress_inner(
+fn calc_target_video_bps(target_mb: f64, clip_dur_secs: f64, audio_bps: u32) -> u32 {
+    // 14% de margen de seguridad para contenedor MP4 y picos de keyframes IDR.
+    let total_budget_bits = target_mb * 1024.0 * 1024.0 * 8.0 * 0.86;
+    let raw_video_bps = (total_budget_bits / clip_dur_secs.max(0.5)) - audio_bps as f64;
+    (raw_video_bps.max(250_000.0) as u32).clamp(250_000, 12_000_000)
+}
+
+fn compress_pass(
     input_path: &Path,
     output_path: &Path,
-    target_mb: f64,
+    video_bitrate_bps: u32,
+    audio_bps: u32,
     start_secs: f64,
     end_secs: f64,
+    use_hardware_encoder: bool,
 ) -> Result<f64> {
     let mut reader_attrs: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut reader_attrs, 2) }?;
@@ -441,14 +520,22 @@ fn compress_inner(
 
     let video_in_idx = video_in_idx.context("El archivo MP4 no contiene pista de video")?;
 
-    // Calcular presupuesto exacto de bitrate con 12% de margen de seguridad para contenedor/picos VBR.
-    let clip_dur = (end_secs - start_secs).max(0.5);
-    let audio_bps: u32 = if audio_in_idx.is_some() { 96_000 } else { 0 };
-    let total_budget_bits = target_mb * 1024.0 * 1024.0 * 8.0 * 0.88;
-    let raw_video_bps = (total_budget_bits / clip_dur) - audio_bps as f64;
-    let video_bitrate_bps = (raw_video_bps as u32).clamp(450_000, 12_000_000);
+    // Cuando el presupuesto es ajustado (<3.5 Mbps) y el video es de 60 fps, reducimos a 30 fps:
+    // duplica los bits disponibles por cuadro, mejora la nitidez y evita overshoot en GPU.
+    let src_fps = src_fps_num as f64 / src_fps_den.max(1) as f64;
+    let (out_fps_num, out_fps_den) = if src_fps > 35.0 && video_bitrate_bps < 3_500_000 {
+        (30u32, 1u32)
+    } else {
+        (src_fps_num, src_fps_den)
+    };
+    let out_fps = (out_fps_num as f64 / out_fps_den.max(1) as f64).max(1.0);
+    let min_frame_step_100ns = if out_fps < src_fps * 0.85 {
+        ((10_000_000.0 / out_fps) * 0.90) as i64
+    } else {
+        0
+    };
 
-    // Escalado inteligente cuando el bitrate por píxel es bajo (mejor 720p nítido que 2K pixelado).
+    // Escalado inteligente cuando el bitrate por píxel es bajo.
     let (out_w, out_h) = choose_compressed_dimensions(src_w, src_h, video_bitrate_bps);
 
     // Configurar lector de video para entregar NV12 escalado en GPU.
@@ -465,7 +552,10 @@ fn compress_inner(
     let writer_attrs = writer_attrs.context("MFCreateAttributes (writer) devolvió None")?;
     unsafe {
         writer_attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
-        writer_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+        writer_attrs.SetUINT32(
+            &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+            u32::from(use_hardware_encoder),
+        )?;
     }
 
     let out_url = HSTRING::from(output_path.as_os_str());
@@ -473,7 +563,7 @@ fn compress_inner(
         unsafe { MFCreateSinkWriterFromURL(&out_url, None, Some(&writer_attrs)) }
             .with_context(|| format!("No se pudo crear {}", output_path.display()))?;
 
-    // Configurar pista de salida H.264 con el bitrate objetivo + entrada NV12.
+    // Configurar pista de salida H.264 con el bitrate objetivo + entrada NV12 + atributos CBR.
     let h264_out = unsafe { MFCreateMediaType() }?;
     unsafe {
         h264_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -481,7 +571,7 @@ fn compress_inner(
         h264_out.SetUINT32(&MF_MT_AVG_BITRATE, video_bitrate_bps)?;
         h264_out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         h264_out.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(out_w, out_h))?;
-        h264_out.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(src_fps_num, src_fps_den))?;
+        h264_out.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(out_fps_num, out_fps_den))?;
         h264_out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
         h264_out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
     }
@@ -489,18 +579,77 @@ fn compress_inner(
     let video_out_idx = unsafe { writer.AddStream(&h264_out) }
         .context("IMFSinkWriter::AddStream (H264 compress) falló")?;
 
+    let mut enc_params: Option<IMFAttributes> = None;
+    unsafe { MFCreateAttributes(&mut enc_params, 5) }?;
+    let enc_params = enc_params.context("MFCreateAttributes (enc_params) devolvió None")?;
+    let gop_frames = (out_fps.round() as u32).max(15) * 2;
+    unsafe {
+        let _ = enc_params.SetUINT32(
+            &CODECAPI_AVEncCommonRateControlMode,
+            eAVEncCommonRateControlMode_CBR.0 as u32,
+        );
+        let _ = enc_params.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, video_bitrate_bps);
+        let _ = enc_params.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, video_bitrate_bps);
+        let _ = enc_params.SetUINT32(&CODECAPI_AVEncMPVGOPSize, gop_frames);
+        let _ = enc_params.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+    }
+
     let nv12_in = unsafe { MFCreateMediaType() }?;
     unsafe {
         nv12_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         nv12_in.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
         nv12_in.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         nv12_in.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(out_w, out_h))?;
-        nv12_in.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(src_fps_num, src_fps_den))?;
+        nv12_in.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(out_fps_num, out_fps_den))?;
         nv12_in.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
-        writer.SetInputMediaType(video_out_idx, &nv12_in, None)?;
+        writer.SetInputMediaType(video_out_idx, &nv12_in, Some(&enc_params))?;
     }
 
-    // Configurar audio: recodificar a AAC 96 kbps (48 kHz estéreo) para maximizar presupuesto de video.
+    // Reforzar los mismos valores vía ICodecAPI directo sobre el MFT interno del SinkWriter.
+    let mut raw_api: *mut std::ffi::c_void = std::ptr::null_mut();
+    if unsafe {
+        writer.GetServiceForStream(
+            video_out_idx,
+            &GUID::zeroed(),
+            &ICodecAPI::IID,
+            &mut raw_api,
+        )
+    }
+    .is_ok()
+        && !raw_api.is_null()
+    {
+        let codec_api = unsafe { ICodecAPI::from_raw(raw_api) };
+        let _ = unsafe {
+            codec_api.SetValue(
+                &CODECAPI_AVEncCommonRateControlMode,
+                &VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
+            )
+        };
+        let _ = unsafe {
+            codec_api.SetValue(
+                &CODECAPI_AVEncCommonMeanBitRate,
+                &VARIANT::from(video_bitrate_bps),
+            )
+        };
+        let _ = unsafe {
+            codec_api.SetValue(
+                &CODECAPI_AVEncCommonMaxBitRate,
+                &VARIANT::from(video_bitrate_bps),
+            )
+        };
+        let _ = unsafe {
+            codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop_frames))
+        };
+        let _ = unsafe {
+            codec_api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32))
+        };
+    }
+
+    // Configurar audio: recodificar a AAC 96 kbps (Microsoft AAC MFT soporta 96/128/160/192 kbps).
+    let aac_bytes_per_sec = match audio_bps {
+        ..=112_000 => 12_000u32,
+        _ => 16_000u32,
+    };
     let audio_out_idx = if let Some(a_in) = audio_in_idx {
         let pcm_type = unsafe { MFCreateMediaType() }?;
         unsafe {
@@ -521,7 +670,7 @@ fn compress_inner(
             aac_out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
             aac_out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000)?;
             aac_out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-            aac_out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 12_000)?; // 96 kbps
+            aac_out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, aac_bytes_per_sec)?;
             aac_out.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
             aac_out.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
         }
@@ -545,6 +694,7 @@ fn compress_inner(
 
     unsafe { writer.BeginWriting() }.context("IMFSinkWriter::BeginWriting (compress) falló")?;
 
+    let nominal_out_dur = (10_000_000.0 / out_fps).round() as i64;
     let mut base_pts: Option<i64> = None;
     let mut last_v_pts: i64 = -1;
     let mut last_a_pts: i64 = -1;
@@ -614,17 +764,24 @@ fn compress_inner(
         }
 
         let mut rel_pts = timestamp - origin;
-        let dur = unsafe { sample.GetSampleDuration() }.unwrap_or(0);
+        let dur = unsafe { sample.GetSampleDuration() }.unwrap_or(nominal_out_dur);
 
         if is_video {
+            // Decimación limpia a 30 fps cuando el presupuesto de bitrate lo requiere.
+            if min_frame_step_100ns > 0 && last_v_pts >= 0 && (rel_pts - last_v_pts) < min_frame_step_100ns {
+                continue;
+            }
             if rel_pts <= last_v_pts {
                 rel_pts = last_v_pts + 1;
             }
             unsafe { sample.SetSampleTime(rel_pts) }?;
+            if min_frame_step_100ns > 0 {
+                let _ = unsafe { sample.SetSampleDuration(nominal_out_dur) };
+            }
             unsafe { writer.WriteSample(video_out_idx, &sample) }
                 .context("IMFSinkWriter::WriteSample (video compress) falló")?;
             last_v_pts = rel_pts;
-            max_rel_pts = max_rel_pts.max(rel_pts + dur.max(0));
+            max_rel_pts = max_rel_pts.max(rel_pts + dur.max(nominal_out_dur));
         } else if let Some(a_out) = audio_out_idx {
             if rel_pts <= last_a_pts {
                 rel_pts = last_a_pts + 1;
@@ -646,9 +803,13 @@ fn compress_inner(
 }
 
 fn choose_compressed_dimensions(src_w: u32, src_h: u32, video_bitrate_bps: u32) -> (u32, u32) {
-    let target_h = if video_bitrate_bps < 2_400_000 && src_h > 720 {
+    let target_h = if video_bitrate_bps < 850_000 && src_h > 480 {
+        480
+    } else if video_bitrate_bps < 1_500_000 && src_h > 540 {
+        540
+    } else if video_bitrate_bps < 3_200_000 && src_h > 720 {
         720
-    } else if video_bitrate_bps < 5_000_000 && src_h > 1080 {
+    } else if video_bitrate_bps < 6_000_000 && src_h > 1080 {
         1080
     } else {
         src_h
@@ -947,5 +1108,39 @@ mod tests {
         assert!(frame.width >= 64 && frame.width <= 384);
         assert!(frame.height >= 36 && frame.height <= 216);
         assert_eq!(frame.rgba.len(), (frame.width * frame.height * 4) as usize);
+    }
+
+    #[test]
+    fn compresses_heavy_clip_under_discord_limit_if_present() {
+        let Ok(profile) = std::env::var("USERPROFILE") else {
+            return;
+        };
+        let candidate = PathBuf::from(profile)
+            .join("Videos")
+            .join("Bals")
+            .join("bals_20261125_002613.mp4");
+        if !candidate.exists() {
+            return;
+        }
+
+        let meta = probe_mp4_metadata(&candidate).expect("probe_mp4_metadata falló");
+        let out = std::env::temp_dir().join("bals_discord_real_test.mp4");
+        let _ = std::fs::remove_file(&out);
+
+        let stats = compress_mp4_to_target_mb(&candidate, &out, 9.5, 0.0, meta.duration_secs)
+            .expect("compress_mp4_to_target_mb falló");
+        let out_mb = stats.output_bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "REAL DISCORD TEST: {:.2} MB -> {:.2} MB in {:.0} ms (dur {:.1}s)",
+            stats.input_bytes as f64 / (1024.0 * 1024.0),
+            out_mb,
+            stats.elapsed_ms,
+            stats.duration_secs
+        );
+        assert!(
+            out_mb <= 9.9,
+            "El archivo comprimido superó el límite de Discord (<10 MB): {out_mb:.2} MB"
+        );
+        let _ = std::fs::remove_file(&out);
     }
 }

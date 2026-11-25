@@ -372,12 +372,11 @@ pub fn draw_vent_grille(ui: &mut egui::Ui, p: &RetroPalette, width: f32, height:
     }
 }
 
-/// Medidor VU LED segmentado retro (24 bloques verde → ámbar → rojo) con peak-hold.
+/// Medidor VU LED segmentado retro (24 bloques continuos verde → ámbar → rojo).
 pub fn draw_led_vu_meter(
     ui: &mut egui::Ui,
     p: &RetroPalette,
     level: f32,
-    peak_hold: f32,
     segments: usize,
     height: f32,
     tooltip: &str,
@@ -401,11 +400,6 @@ pub fn draw_led_vu_meter(
 
     let clamped = level.clamp(0.0, 1.0);
     let active_count = (clamped * segments as f32).round() as usize;
-    let peak_idx = if peak_hold > 0.03 {
-        Some(((peak_hold.clamp(0.0, 1.0) * segments as f32).ceil() as usize).saturating_sub(1))
-    } else {
-        None
-    };
 
     for i in 0..segments {
         let frac = (i + 1) as f32 / segments as f32;
@@ -420,11 +414,10 @@ pub fn draw_led_vu_meter(
             p.accent
         };
 
-        let is_lit = i < active_count || peak_idx == Some(i);
-        let color = if is_lit {
+        let color = if i < active_count {
             lit_color
         } else {
-            Color32::from_rgba_unmultiplied(lit_color.r(), lit_color.g(), lit_color.b(), 30)
+            Color32::from_rgba_unmultiplied(lit_color.r(), lit_color.g(), lit_color.b(), 28)
         };
         painter.rect_filled(seg_rect, 1.0, color);
     }

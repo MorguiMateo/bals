@@ -599,6 +599,7 @@ fn apply_config_update(
     let needs_restart = new_cfg.resolution != cfg.resolution
         || new_cfg.fps != cfg.fps
         || new_cfg.quality != cfg.quality
+        || new_cfg.encoder_pref != cfg.encoder_pref
         || new_cfg.replay_duration != cfg.replay_duration
         || new_cfg.audio_capture_mode != cfg.audio_capture_mode
         || new_cfg.mic_enabled != cfg.mic_enabled

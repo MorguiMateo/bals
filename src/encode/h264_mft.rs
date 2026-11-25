@@ -24,16 +24,101 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video,
     MFSampleExtension_CleanPoint, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_PeakConstrainedVBR,
-    eAVEncH264VProfile_High,
+    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{IUnknown, Interface};
 
-use crate::config::VideoConfig;
+use crate::config::{EncoderPreference, VideoConfig};
 use crate::d3d::SharedD3DDevice;
 use crate::encode::{EncodedVideoPacket, annexb_contains_idr};
+
+/// Resumen de encoders H.264 disponibles en el sistema (para mostrar en el selector de la UI).
+#[derive(Debug, Clone, Default)]
+pub struct DetectedEncoders {
+    pub hw_name: Option<String>,
+    pub hw_short: Option<String>,
+    pub sw_name: Option<String>,
+}
+
+/// Enumera los encoders H.264 (Hardware GPU y Software CPU) instalados en Windows Media Foundation.
+pub fn detect_system_encoders() -> DetectedEncoders {
+    let mut out = DetectedEncoders::default();
+    if unsafe { MFStartup(MF_VERSION, 0) }.is_err() {
+        return out;
+    }
+
+    if let Some(hw) = first_enumerated_encoder_name(true) {
+        out.hw_short = Some(short_hw_label(&hw));
+        out.hw_name = Some(hw);
+    }
+    out.sw_name = first_enumerated_encoder_name(false);
+
+    unsafe {
+        let _ = MFShutdown();
+    }
+    out
+}
+
+fn short_hw_label(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("nvidia") || lower.contains("nvenc") {
+        "NVENC".to_string()
+    } else if lower.contains("amd") || lower.contains("amf") || lower.contains("vce") {
+        "AMD AMF".to_string()
+    } else if lower.contains("intel") || lower.contains("qsv") {
+        "INTEL QSV".to_string()
+    } else {
+        "GPU HW".to_string()
+    }
+}
+
+fn first_enumerated_encoder_name(hardware: bool) -> Option<String> {
+    let output_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
+    let flags = if hardware {
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER
+    } else {
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER
+    };
+
+    let mut raw_activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    if unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            None,
+            Some(&output_info),
+            &mut raw_activates,
+            &mut count,
+        )
+    }
+    .is_err()
+        || count == 0
+        || raw_activates.is_null()
+    {
+        return None;
+    }
+
+    let mut found = None;
+    let slice = unsafe { std::slice::from_raw_parts_mut(raw_activates, count as usize) };
+    for slot in slice.iter_mut() {
+        if let Some(activate) = slot.take() {
+            if found.is_none() {
+                found = get_friendly_name(&activate);
+            }
+        }
+    }
+    unsafe {
+        CoTaskMemFree(Some(raw_activates as *const _));
+    }
+    found
+}
 
 /// Encoder H.264 por Hardware vía Windows Media Foundation (NVENC / AMD AMF / Intel QSV),
 /// con soporte Zero-Copy sobre texturas D3D11 `NV12` y fallback automático a MFT software.
@@ -73,14 +158,25 @@ impl H264Encoder {
     }
 
     fn init_inner(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
-        // 1. Buscar primero encoders H.264 por HARDWARE (AMD AMF / NVIDIA NVENC / Intel QSV).
-        //    Si no hay hardware disponible (PC muy antiguo), hacer fallback a software MFT.
-        let (mft, name, is_hardware) = match activate_h264_mft(true) {
-            Ok((mft, name)) => (mft, name, true),
-            Err(hw_err) => {
-                warn!("No se pudo activar encoder H.264 por hardware ({hw_err:#}); usando fallback software");
+        // 1. Elegir encoder H.264 según la preferencia del usuario (Auto GPU, Solo GPU o CPU Software).
+        let (mft, name, is_hardware) = match config.encoder_pref {
+            EncoderPreference::AutoGpu => match activate_h264_mft(true) {
+                Ok((mft, name)) => (mft, name, true),
+                Err(hw_err) => {
+                    warn!("No se pudo activar encoder H.264 por hardware ({hw_err:#}); usando fallback software");
+                    let (mft, name) = activate_h264_mft(false)
+                        .context("No se encontró ningún encoder H.264 en Media Foundation")?;
+                    (mft, name, false)
+                }
+            },
+            EncoderPreference::HardwareGpu => {
+                let (mft, name) = activate_h264_mft(true)
+                    .context("No se pudo activar el encoder H.264 por hardware de tu GPU")?;
+                (mft, name, true)
+            }
+            EncoderPreference::SoftwareCpu => {
                 let (mft, name) = activate_h264_mft(false)
-                    .context("No se encontró ningún encoder H.264 en Media Foundation")?;
+                    .context("No se encontró el encoder H.264 por software (CPU)")?;
                 (mft, name, false)
             }
         };
@@ -553,27 +649,29 @@ fn configure_codec_api(mft: &IMFTransform, config: VideoConfig) {
         }
     };
 
-    set_u32(
-        &CODECAPI_AVEncCommonRateControlMode,
-        eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
-        "RateControlMode=PeakConstrainedVBR",
-    );
+    // 1. Activar baja latencia y 0 B-frames PRIMERO (en AMD AMF cambiar LowLatencyMode
+    //    después del bitrate puede resetear el rate-control interno del driver).
+    set_bool(&CODECAPI_AVLowLatencyMode, true, "LowLatencyMode=true");
+    set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");
+    set_u32(&CODECAPI_AVEncMPVGOPSize, config.gop_frames(), "GOPSize");
+    set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 50, "QualityVsSpeed=50");
+
+    // 2. Configurar rate-control con techo estricto (PeakConstrainedVBR + fallback CBR).
+    let max_bitrate = config.bitrate_bps.saturating_mul(125) / 100;
+    let vbr_mode = VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
+    if unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &vbr_mode) }.is_err() {
+        set_u32(
+            &CODECAPI_AVEncCommonRateControlMode,
+            eAVEncCommonRateControlMode_CBR.0 as u32,
+            "RateControlMode=CBR",
+        );
+    }
     set_u32(
         &CODECAPI_AVEncCommonMeanBitRate,
         config.bitrate_bps,
         "MeanBitRate",
     );
-    set_u32(
-        &CODECAPI_AVEncCommonMaxBitRate,
-        config.bitrate_bps.saturating_mul(3) / 2,
-        "MaxBitRate",
-    );
-    // Equilibrio velocidad/calidad (50 = alta calidad con <1 ms en GPU moderna).
-    set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 50, "QualityVsSpeed=50");
-    set_u32(&CODECAPI_AVEncMPVGOPSize, config.gop_frames(), "GOPSize");
-    // 0 B-frames: baja latencia, menos VRAM y PTS == DTS para muxing MP4 simple y fiable.
-    set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");
-    set_bool(&CODECAPI_AVLowLatencyMode, true, "LowLatencyMode=true");
+    set_u32(&CODECAPI_AVEncCommonMaxBitRate, max_bitrate, "MaxBitRate");
 }
 
 fn create_sample_from_texture(

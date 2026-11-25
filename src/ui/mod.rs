@@ -18,6 +18,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::audio::meter::AudioLevelMonitor;
 use crate::config::{AppConfig, UiTheme};
+use crate::encode::h264_mft::{DetectedEncoders, detect_system_encoders};
 use crate::hotkey::parse_hotkey;
 use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
@@ -48,8 +49,8 @@ pub(crate) struct ClipEntry {
 
 pub(crate) enum TrimState {
     Idle,
-    Running,
-    Done(TrimStats),
+    Running(String),
+    Done(TrimStats, bool),
     Error(String),
 }
 
@@ -83,11 +84,13 @@ pub(crate) struct BalsUiApp {
     pub last_telemetry_poll: Instant,
     pub last_clip_event_seq: u32,
 
-    // Auto-updater y audio VU con peak-hold
+    // Auto-updater, encoders detectados y audio VU continuo (sin peak-hold desconectado)
+    pub detected_encoders: DetectedEncoders,
     pub update_state: Arc<Mutex<UpdateUiState>>,
     pub audio_meter: AudioLevelMonitor,
-    pub desktop_peak_hold: f32,
-    pub mic_peak_hold: f32,
+    pub desktop_vu_display: f32,
+    pub mic_vu_display: f32,
+    last_vu_tick: Instant,
 
     // Logo pixel-art CRT embebido
     pub logo_texture: Option<egui::TextureHandle>,
@@ -122,6 +125,7 @@ impl BalsUiApp {
         let daemon_running = ipc::is_daemon_running();
         let telemetry = ipc::read_engine_telemetry();
         let last_clip_event_seq = telemetry.as_ref().map_or(0, |t| t.clip_event_seq);
+        let detected_encoders = detect_system_encoders();
 
         // Cargar ícono CRT 64×64 pixel-art con filtrado NEAREST (sin blur).
         let raw_icon = include_bytes!("../../assets/icon_64.rgba");
@@ -145,10 +149,12 @@ impl BalsUiApp {
             telemetry,
             last_telemetry_poll: Instant::now(),
             last_clip_event_seq,
+            detected_encoders,
             update_state: Arc::new(Mutex::new(UpdateUiState::Idle)),
             audio_meter: AudioLevelMonitor::start(),
-            desktop_peak_hold: 0.0,
-            mic_peak_hold: 0.0,
+            desktop_vu_display: 0.0,
+            mic_vu_display: 0.0,
+            last_vu_tick: Instant::now(),
             logo_texture,
             clips,
             clip_filter: String::new(),
@@ -297,17 +303,17 @@ impl BalsUiApp {
         let state_arc = Arc::clone(&self.trim_state);
 
         if let Ok(mut st) = state_arc.lock() {
-            if matches!(*st, TrimState::Running) {
+            if matches!(*st, TrimState::Running(_)) {
                 return;
             }
-            *st = TrimState::Running;
+            *st = TrimState::Running("RECORTANDO...".to_string());
         }
 
         std::thread::spawn(move || {
             let res = trim_mp4_passthrough(&input_path, &output_path, start, end);
             if let Ok(mut st) = state_arc.lock() {
                 *st = match res {
-                    Ok(stats) => TrimState::Done(stats),
+                    Ok(stats) => TrimState::Done(stats, false),
                     Err(err) => TrimState::Error(format!("{err:#}")),
                 };
             }
@@ -324,17 +330,21 @@ impl BalsUiApp {
         let state_arc = Arc::clone(&self.trim_state);
 
         if let Ok(mut st) = state_arc.lock() {
-            if matches!(*st, TrimState::Running) {
+            if matches!(*st, TrimState::Running(_)) {
                 return;
             }
-            *st = TrimState::Running;
+            *st = TrimState::Running(format!("COMPRIMIENDO <{:.0}MB...", target_mb.ceil()));
         }
+        self.set_banner(
+            format!("Comprimiendo clip a <{:.0} MB (espera unos segundos)...", target_mb.ceil()),
+            false,
+        );
 
         std::thread::spawn(move || {
             let res = compress_mp4_to_target_mb(&input_path, &output_path, target_mb, start, end);
             if let Ok(mut st) = state_arc.lock() {
                 *st = match res {
-                    Ok(stats) => TrimState::Done(stats),
+                    Ok(stats) => TrimState::Done(stats, true),
                     Err(err) => TrimState::Error(format!("{err:#}")),
                 };
             }
@@ -380,7 +390,7 @@ impl BalsUiApp {
         });
     }
 
-    fn poll_background_states(&mut self, ctx: &egui::Context) -> bool {
+    fn poll_background_states(&mut self, ctx: &egui::Context) -> Option<String> {
         // 1. Telemetría compartida daemon → UI cada 200 ms (0 I/O en disco).
         if self.last_telemetry_poll.elapsed() >= Duration::from_millis(200) {
             self.last_telemetry_poll = Instant::now();
@@ -437,25 +447,30 @@ impl BalsUiApp {
 
         // 4. Estado del trimmer / compresor en segundo plano.
         let mut finished_trim_msg: Option<(String, bool)> = None;
-        let mut trim_in_progress = false;
+        let mut running_op: Option<String> = None;
         if let Ok(mut st) = self.trim_state.lock() {
             match &*st {
-                TrimState::Running => trim_in_progress = true,
-                TrimState::Done(stats) => {
+                TrimState::Running(label) => running_op = Some(label.clone()),
+                TrimState::Done(stats, was_compress) => {
                     let name = stats
                         .output_path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    finished_trim_msg = Some((
+                    let in_mb = stats.input_bytes as f64 / (1024.0 * 1024.0);
+                    let out_mb = stats.output_bytes as f64 / (1024.0 * 1024.0);
+                    let msg = if *was_compress && stats.input_bytes > 0 {
+                        let pct = ((1.0 - (out_mb / in_mb)) * 100.0).round() as i32;
                         format!(
-                            "OK ({:.0}ms): {name} ({:.1}s · {:.1} MB)",
-                            stats.elapsed_ms,
-                            stats.duration_secs,
-                            stats.output_bytes as f64 / (1024.0 * 1024.0)
-                        ),
-                        false,
-                    ));
+                            "COMPRIMIDO: {name} ({in_mb:.1} -> {out_mb:.1} MB · -{pct}%)"
+                        )
+                    } else {
+                        format!(
+                            "OK ({:.0}ms): {name} ({:.1}s · {out_mb:.1} MB)",
+                            stats.elapsed_ms, stats.duration_secs
+                        )
+                    };
+                    finished_trim_msg = Some((msg, false));
                     *st = TrimState::Idle;
                 }
                 TrimState::Error(msg) => {
@@ -465,7 +480,7 @@ impl BalsUiApp {
                 TrimState::Idle => {}
             }
         }
-        if trim_in_progress {
+        if running_op.is_some() {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
         if let Some((msg, is_err)) = finished_trim_msg {
@@ -480,30 +495,34 @@ impl BalsUiApp {
             }
         }
 
-        // 6. Actualizar peak-hold de los medidores VU.
-        let d_lvl = (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
-        if d_lvl >= self.desktop_peak_hold {
-            self.desktop_peak_hold = d_lvl;
-        } else {
-            self.desktop_peak_hold = (self.desktop_peak_hold - 0.018).max(0.0);
-        }
+        // 6. Actualizar barras VU con ataque instantáneo y decaimiento continuo uniforme (~0.35 s).
+        let dt = self.last_vu_tick.elapsed().as_secs_f32().clamp(0.0, 0.25);
+        self.last_vu_tick = Instant::now();
+        let decay = dt * 2.8;
 
-        let m_lvl = if self.cfg.mic_enabled {
+        let d_raw = (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
+        self.desktop_vu_display = if d_raw >= self.desktop_vu_display {
+            d_raw
+        } else {
+            (self.desktop_vu_display - decay).max(d_raw)
+        };
+
+        let m_raw = if self.cfg.mic_enabled {
             (self.audio_meter.mic_level() * self.cfg.mic_volume).min(1.0)
         } else {
             0.0
         };
-        if m_lvl >= self.mic_peak_hold {
-            self.mic_peak_hold = m_lvl;
+        self.mic_vu_display = if m_raw >= self.mic_vu_display {
+            m_raw
         } else {
-            self.mic_peak_hold = (self.mic_peak_hold - 0.018).max(0.0);
-        }
+            (self.mic_vu_display - decay).max(m_raw)
+        };
 
         // Pausar cadencia alta del VU cuando la ventana pierde foco.
         let focused = ctx.input(|i| i.focused);
         self.audio_meter.set_paused(!focused);
 
-        trim_in_progress
+        running_op
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
@@ -617,7 +636,7 @@ impl eframe::App for BalsUiApp {
 
         let p = RetroPalette::for_theme(self.cfg.ui_theme);
         self.handle_keyboard_shortcuts(&ctx);
-        let trim_in_progress = self.poll_background_states(&ctx);
+        let running_op = self.poll_background_states(&ctx);
 
         // Refresco fluido para VU meters y pulso LED (~25 FPS activo, ~5 FPS en segundo plano).
         let repaint_ms = if ctx.input(|i| i.focused) { 40 } else { 200 };
@@ -779,14 +798,13 @@ impl eframe::App for BalsUiApp {
                             col,
                         );
                     } else {
-                        let g_lvl =
-                            (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
-                        let m_lvl = if self.cfg.mic_enabled {
-                            (self.audio_meter.mic_level() * self.cfg.mic_volume).min(1.0)
-                        } else {
-                            0.0
-                        };
-                        draw_mini_bezel_vu(ui, &p, g_lvl, m_lvl, self.cfg.mic_enabled);
+                        draw_mini_bezel_vu(
+                            ui,
+                            &p,
+                            self.desktop_vu_display,
+                            self.mic_vu_display,
+                            self.cfg.mic_enabled,
+                        );
 
                         ui.add_space(8.0);
                         ui.label(
@@ -857,9 +875,12 @@ impl eframe::App for BalsUiApp {
                 inner_frame.show(ui, |ui| {
                     match self.tab {
                         Tab::Settings => settings_view::render_settings_tab(self, ui, &p),
-                        Tab::Clips => {
-                            clips_view::render_clips_tab(self, ui, &p, trim_in_progress)
-                        }
+                        Tab::Clips => clips_view::render_clips_tab(
+                            self,
+                            ui,
+                            &p,
+                            running_op.as_deref(),
+                        ),
                     }
                 });
 
