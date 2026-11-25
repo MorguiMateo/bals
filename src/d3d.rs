@@ -55,6 +55,10 @@ impl SharedD3DDevice {
         let dxgi_device: IDXGIDevice = device
             .cast()
             .context("No se pudo obtener IDXGIDevice desde ID3D11Device")?;
+        // Prioridad elevada en cola GPU (best-effort; evita inanición cuando el juego usa 99% GPU).
+        unsafe {
+            let _ = dxgi_device.SetGPUThreadPriority(5);
+        }
         let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
             .context("CreateDirect3D11DeviceFromDXGIDevice falló")?;
         let winrt_device: IDirect3DDevice = inspectable

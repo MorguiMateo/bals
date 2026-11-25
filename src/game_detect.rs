@@ -2,7 +2,7 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{CloseHandle, HWND, RECT, STILL_ACTIVE};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -48,9 +48,11 @@ pub struct DetectedGame {
     pub hwnd: HWND,
     pub pid: u32,
     pub exe_name: String,
+    pub is_fullscreen: bool,
+    pub monitor: HMONITOR,
 }
 
-// `HWND` es un handle numérico del SO; puede transferirse de forma segura.
+// `HWND` y `HMONITOR` son handles numéricos del SO; pueden transferirse de forma segura.
 unsafe impl Send for DetectedGame {}
 
 /// Inspecciona la ventana en primer plano con impacto casi nulo en CPU (~0.01%).
@@ -80,6 +82,7 @@ pub fn detect_foreground_game(extra_game_exes: &[String]) -> Option<DetectedGame
 
     let exe_name = process_exe_name(pid)?;
     let exe_lower = exe_name.to_ascii_lowercase();
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
 
     // 1. Coincidencia explícita en la lista del usuario (funciona también en modo ventana).
     if extra_game_exes
@@ -90,6 +93,8 @@ pub fn detect_foreground_game(extra_game_exes: &[String]) -> Option<DetectedGame
             hwnd,
             pid,
             exe_name,
+            is_fullscreen: is_fullscreen_window(hwnd),
+            monitor,
         });
     }
 
@@ -104,6 +109,8 @@ pub fn detect_foreground_game(extra_game_exes: &[String]) -> Option<DetectedGame
             hwnd,
             pid,
             exe_name,
+            is_fullscreen: true,
+            monitor,
         });
     }
 

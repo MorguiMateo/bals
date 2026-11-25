@@ -17,7 +17,7 @@ use windows::core::Interface;
 
 use crate::d3d::SharedD3DDevice;
 
-const NV12_POOL_SIZE: usize = 8;
+const NV12_POOL_SIZE: usize = 12;
 
 struct Nv12Slot {
     texture: ID3D11Texture2D,

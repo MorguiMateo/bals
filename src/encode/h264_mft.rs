@@ -281,8 +281,8 @@ impl H264Encoder {
         }
         .with_context(|| format!("SetInputType (NV12) falló en {name}"))?;
 
-        // Configurar parámetros óptimos de calidad local (sin LowLatencyMode + QVBR/VBR con techo).
-        configure_codec_api(&mft, config);
+        // Configurar parámetros óptimos de calidad/velocidad según el vendor del encoder.
+        configure_codec_api(&mft, config, &name);
 
         let out_info = unsafe { mft.GetOutputStreamInfo(0) }
             .context("GetOutputStreamInfo falló")?;
@@ -662,12 +662,13 @@ fn get_friendly_name(activate: &IMFActivate) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
-/// Configura parámetros óptimos de calidad local (0% CPU/GPU extra):
-/// - `AVLowLatencyMode = false`: permite al chip ASIC (NVENC/AMF/QSV) usar estimación de movimiento
-///   completa (~15–20% más nitidez al mismo bitrate).
-/// - `QualityVsSpeed = 70`: mayor calidad visual usando el ASIC dedicado sin afectar shaders 3D.
-/// - **QVBR** (`Quality` + `CommonQuality` + techo `MaxBitRate`), con fallback a `PeakConstrainedVBR` / `CBR`.
-fn configure_codec_api(mft: &IMFTransform, config: VideoConfig) {
+/// Configura parámetros óptimos de codificación H.264 según el fabricante del ASIC:
+/// - **AMD AMF (VCE/VCN):** usa el fast-path en tiempo real (`AVLowLatencyMode = true`,
+///   `QualityVsSpeed = 30` preset *Speed*, y `PeakConstrainedVBR` con techo 1.35×) para sostener
+///   60 FPS bloqueados en 1080p sin saturar VCE/VCN ni generar tirones en GPUs Polaris/Vega/Win10.
+/// - **NVIDIA NVENC / Intel QSV / CPU SW:** mantiene `AVLowLatencyMode = false`, `QualityVsSpeed = 70`
+///   y **QVBR** (`Quality` + `CommonQuality` + techo `MaxBitRate`) para máxima nitidez por MB.
+fn configure_codec_api(mft: &IMFTransform, config: VideoConfig, encoder_name: &str) {
     let Ok(codec_api) = mft.cast::<ICodecAPI>() else {
         debug!("El MFT no expone ICodecAPI; se usarán sus valores por defecto");
         return;
@@ -687,15 +688,41 @@ fn configure_codec_api(mft: &IMFTransform, config: VideoConfig) {
         }
     };
 
-    // 1. Modo grabación local (no streaming de ultra-baja latencia) para máxima nitidez por MB.
-    set_bool(&CODECAPI_AVLowLatencyMode, false, "LowLatencyMode=false");
+    let is_amd = vendor_token(encoder_name) == Some("amd");
+    let max_bitrate = config.bitrate_bps.saturating_mul(135) / 100;
+
     set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");
     set_u32(&CODECAPI_AVEncMPVGOPSize, config.gop_frames(), "GOPSize");
+
+    if is_amd {
+        // Fast-path en tiempo real para AMD AMF (evita buffering interno y picos >16.6 ms/frame).
+        set_bool(&CODECAPI_AVLowLatencyMode, true, "LowLatencyMode=true (AMD)");
+        set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 30, "QualityVsSpeed=30 (AMD Speed)");
+
+        let vbr_mode = VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
+        if unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &vbr_mode) }.is_err() {
+            set_u32(
+                &CODECAPI_AVEncCommonRateControlMode,
+                eAVEncCommonRateControlMode_CBR.0 as u32,
+                "RateControlMode=CBR (AMD)",
+            );
+        }
+        set_u32(&CODECAPI_AVEncCommonMeanBitRate, config.bitrate_bps, "MeanBitRate (AMD)");
+        set_u32(&CODECAPI_AVEncCommonMaxBitRate, max_bitrate, "MaxBitRate (AMD)");
+        debug!(
+            mean_mbps = format!("{:.1}", config.bitrate_bps as f64 / 1_000_000.0),
+            max_mbps = format!("{:.1}", max_bitrate as f64 / 1_000_000.0),
+            "Perfil AMD AMF fast-path activado (LowLatency + Speed + PeakConstrainedVBR)"
+        );
+        return;
+    }
+
+    // 1. Modo grabación local para NVENC / QSV / SW: máxima nitidez por MB.
+    set_bool(&CODECAPI_AVLowLatencyMode, false, "LowLatencyMode=false");
     set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 70, "QualityVsSpeed=70");
 
     // 2. Rate-control QVBR (Calidad constante con techo MaxBitRate) -> clips livianos en escenas
     //    quietas y nítidos en acción rápida sin disparar el consumo de RAM del Replay Buffer.
-    let max_bitrate = config.bitrate_bps.saturating_mul(135) / 100;
     let quality_var = VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32);
     let q_val = VARIANT::from(config.qvbr_quality_level());
 

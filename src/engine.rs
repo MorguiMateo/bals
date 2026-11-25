@@ -10,7 +10,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+    CreateWaitableTimerExW, GetCurrentThread, SetThreadPriority, SetWaitableTimer,
+    THREAD_PRIORITY_ABOVE_NORMAL, WaitForSingleObject,
 };
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible};
@@ -18,8 +19,9 @@ use windows::core::PCWSTR;
 
 use crate::audio::AudioPipeline;
 use crate::buffer::ReplayBuffer;
-use crate::capture::{CaptureTarget, resolve_monitor_target};
-use crate::capture::wgc::WgcCapture;
+use crate::capture::{
+    CaptureTarget, FrameCapture, is_windows_11_or_later, resolve_monitor_target,
+};
 use crate::clock;
 use crate::config::{AppConfig, AudioCaptureMode, AudioSource, CaptureMode, VideoConfig};
 use crate::d3d::SharedD3DDevice;
@@ -166,9 +168,15 @@ impl Drop for HighResWaitTimer {
 /// audio y el timer de 1 ms (verdadero 0% GPU y 0 MB VRAM en escritorio).
 struct ActiveSession {
     d3d: SharedD3DDevice,
-    capture: Option<WgcCapture>,
+    capture: Option<FrameCapture>,
+    capture_target: CaptureTarget,
+    prefer_dxgi: bool,
+    capture_backend: &'static str,
     capture_cursor: bool,
+    /// Ventana del juego detectado para pausar en Alt-Tab (incluso si capturamos su monitor con DXGI).
     target_hwnd: Option<HWND>,
+    /// Momento desde el cual la ventana del juego perdió el foco (para debounce de Alt-Tab en modo monitor).
+    lost_focus_at: Option<Instant>,
     converter: GpuNv12Converter,
     encoder: H264Encoder,
     encoder_label: String,
@@ -181,7 +189,7 @@ struct ActiveSession {
     total_paused_100ns: i64,
     /// Timestamp QPC en el que se entró en pausa por Alt-Tab (si actualmente está pausado).
     paused_since_100ns: Option<i64>,
-    /// Último momento en que WGC entregó un frame real (para detectar juegos congelados en Alt-Tab).
+    /// Último momento en que WGC/DXGI entregó un frame real (para detectar juegos congelados en Alt-Tab).
     last_wgc_frame_at: Instant,
     /// Índice del próximo frame CFR a emitir.
     frame_index: u64,
@@ -197,19 +205,23 @@ impl ActiveSession {
     fn start(
         cfg: &AppConfig,
         target: CaptureTarget,
+        alt_tab_hwnd: Option<HWND>,
+        prefer_dxgi: bool,
         audio_source: AudioSource,
         state: RecordingState,
     ) -> Result<Self> {
         let timer_guard = HighResTimerGuard::new();
         let d3d = SharedD3DDevice::new()?;
         let video_config = cfg.video_config();
-        let capture = WgcCapture::start(&d3d, target, cfg.capture_cursor)?;
+        let capture = FrameCapture::start(&d3d, target, cfg.capture_cursor, prefer_dxgi)?;
+        let (init_w, init_h) = capture.initial_size();
+        let capture_backend = capture.backend_label();
         let (out_w, out_h) = video_config.resolution.dimensions();
 
         let converter = GpuNv12Converter::new(
             &d3d,
-            capture.initial_size.Width as u32,
-            capture.initial_size.Height as u32,
+            init_w,
+            init_h,
             out_w,
             out_h,
             video_config.fps.as_u32(),
@@ -246,16 +258,20 @@ impl ActiveSession {
         };
 
         let qpc_origin_100ns = clock::now_100ns();
-        let target_hwnd = match target {
+        let target_hwnd = alt_tab_hwnd.or(match target {
             CaptureTarget::Window(hwnd) => Some(hwnd),
             _ => None,
-        };
+        });
 
         Ok(Self {
             d3d,
             capture: Some(capture),
+            capture_target: target,
+            prefer_dxgi,
+            capture_backend,
             capture_cursor: cfg.capture_cursor,
             target_hwnd,
+            lost_focus_at: None,
             converter,
             encoder,
             encoder_label,
@@ -288,10 +304,24 @@ impl ActiveSession {
         let is_minimized = unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() };
         let is_foreground = unsafe { GetForegroundWindow() == hwnd };
 
-        // Si el juego está minimizado o sin foco y dejó de emitir frames (>500 ms), pausamos
-        // para NO sobrescribir el ReplayBuffer con frames congelados ni perder lo grabado.
-        let should_pause = is_minimized
-            || (!is_foreground && self.last_wgc_frame_at.elapsed() > Duration::from_millis(500));
+        if is_foreground {
+            self.lost_focus_at = None;
+        } else if self.lost_focus_at.is_none() {
+            self.lost_focus_at = Some(Instant::now());
+        }
+
+        // Si capturamos el monitor entero para un juego en Win10 (DXGI), el monitor sigue enviando
+        // frames del escritorio durante Alt-Tab; pausamos tras 400 ms sin foco para no pisar el clip.
+        let is_monitor_for_game = !matches!(self.capture_target, CaptureTarget::Window(_));
+        let should_pause = if is_monitor_for_game {
+            is_minimized
+                || self
+                    .lost_focus_at
+                    .is_some_and(|t| t.elapsed() > Duration::from_millis(400))
+        } else {
+            is_minimized
+                || (!is_foreground && self.last_wgc_frame_at.elapsed() > Duration::from_millis(500))
+        };
 
         if should_pause && self.paused_since_100ns.is_none() {
             self.paused_since_100ns = Some(clock::now_100ns());
@@ -307,12 +337,16 @@ impl ActiveSession {
         }
 
         if !should_pause && self.paused_since_100ns.is_some() {
-            // Si WGC se había soltado durante el Alt-Tab (ej. fullscreen exclusivo), re-engancharlo
+            // Si la captura se había soltado durante el Alt-Tab (ej. fullscreen exclusivo), re-engancharla
             // manteniendo intacto todo el ReplayBuffer.
             if self.capture.is_none() {
-                if let Ok(new_cap) =
-                    WgcCapture::start(&self.d3d, CaptureTarget::Window(hwnd), self.capture_cursor)
-                {
+                if let Ok(new_cap) = FrameCapture::start(
+                    &self.d3d,
+                    self.capture_target,
+                    self.capture_cursor,
+                    self.prefer_dxgi,
+                ) {
+                    self.capture_backend = new_cap.backend_label();
                     self.capture = Some(new_cap);
                 } else {
                     return false;
@@ -439,6 +473,9 @@ impl RecorderEngine {
         let handle = thread::Builder::new()
             .name("bals-engine".to_string())
             .spawn(move || {
+                unsafe {
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                }
                 if let Err(err) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
                     error!("RoInitialize falló en bals-engine: {err}");
                     return;
@@ -679,13 +716,22 @@ fn apply_config_update(
 fn start_manual_session(cfg: &AppConfig, session: &mut Option<ActiveSession>) {
     *session = None;
     let (target, monitor_label) = resolve_monitor_target(cfg.selected_monitor.as_deref());
+    let prefer_dxgi = !is_windows_11_or_later();
     let state = RecordingState::RecordingManual {
         monitor_label: monitor_label.clone(),
     };
-    match ActiveSession::start(cfg, target, AudioSource::SystemLoopback, state) {
+    match ActiveSession::start(
+        cfg,
+        target,
+        None,
+        prefer_dxgi,
+        AudioSource::SystemLoopback,
+        state,
+    ) {
         Ok(active) => {
             info!(
                 monitor = %monitor_label,
+                capture = active.capture_backend,
                 resolution = %cfg.resolution,
                 fps = %cfg.fps,
                 replay = %cfg.replay_duration,
@@ -726,12 +772,22 @@ fn poll_game_autodetect(
         hwnd,
         pid,
         exe_name,
+        is_fullscreen,
+        monitor,
     }) = detect_foreground_game(&cfg.extra_game_exes)
     {
+        let use_win10_dxgi = !is_windows_11_or_later() && is_fullscreen;
+        let primary_target = if use_win10_dxgi {
+            CaptureTarget::Monitor(monitor)
+        } else {
+            CaptureTarget::Window(hwnd)
+        };
+
         info!(
             game = %exe_name,
             pid,
             audio_mode = ?cfg.audio_capture_mode,
+            win10_dxgi = use_win10_dxgi,
             "Juego detectado automáticamente; iniciando Replay Buffer CFR"
         );
         let audio_src = match cfg.audio_capture_mode {
@@ -746,13 +802,26 @@ fn poll_game_autodetect(
             pid,
             paused_alt_tab: false,
         };
-        match ActiveSession::start(cfg, CaptureTarget::Window(hwnd), audio_src, state) {
+        match ActiveSession::start(
+            cfg,
+            primary_target,
+            Some(hwnd),
+            use_win10_dxgi,
+            audio_src,
+            state,
+        ) {
             Ok(active) => {
+                info!(
+                    game = %exe_name,
+                    capture = active.capture_backend,
+                    encoder = %active.encoder_label,
+                    "Sesión de juego iniciada"
+                );
                 *session = Some(active);
                 publish_status(session, cfg, shared_status, event_tx, telemetry);
             }
             Err(err) => {
-                warn!(game = %exe_name, "No se pudo enganchar ventana WGC ({err:#}); intentando monitor principal");
+                warn!(game = %exe_name, "No se pudo enganchar captura principal ({err:#}); intentando monitor del juego");
                 let fallback_state = RecordingState::RecordingGame {
                     exe_name,
                     pid,
@@ -760,7 +829,9 @@ fn poll_game_autodetect(
                 };
                 if let Ok(active) = ActiveSession::start(
                     cfg,
-                    CaptureTarget::PrimaryMonitor,
+                    CaptureTarget::Monitor(monitor),
+                    Some(hwnd),
+                    false,
                     audio_src,
                     fallback_state,
                 ) {

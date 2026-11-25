@@ -20,17 +20,18 @@ mod ui;
 mod updater;
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 
 use crate::audio::AudioPipeline;
 use crate::buffer::ReplayBuffer;
-use crate::capture::CaptureTarget;
-use crate::capture::wgc::WgcCapture;
+use crate::capture::{CaptureTarget, FrameCapture};
 use crate::config::{
     AppConfig, AudioConfig, AudioSource, EncoderPreference, FrameRate, QualityPreset,
     ReplayDuration, Resolution, VideoConfig,
@@ -42,6 +43,12 @@ use crate::engine::RecorderEngine;
 use crate::muxer::{generate_clip_path, write_mp4_clip};
 
 fn main() -> Result<()> {
+    // Activar Per-Monitor DPI Awareness V2 desde el arranque: requerido para coordenadas físicas
+    // reales de monitores (1440p/4K con escalado) y para DXGI Desktop Duplication en Windows 10/11.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -151,8 +158,16 @@ fn run_cli_test(test_args: &[String]) -> Result<()> {
         ..AudioConfig::default()
     };
 
+    let force_dxgi = test_args.iter().any(|s| s.eq_ignore_ascii_case("--dxgi"));
+
     unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.context("RoInitialize falló")?;
-    let res = run_av_clip_test(video_config, audio_config, ReplayDuration::Sec30, record_secs);
+    let res = run_av_clip_test(
+        video_config,
+        audio_config,
+        ReplayDuration::Sec30,
+        record_secs,
+        force_dxgi,
+    );
     unsafe { RoUninitialize() };
     res
 }
@@ -162,19 +177,21 @@ fn run_av_clip_test(
     audio_config: AudioConfig,
     replay_duration: ReplayDuration,
     record_secs: u64,
+    prefer_dxgi: bool,
 ) -> Result<()> {
     unsafe {
         windows::Win32::Media::timeBeginPeriod(1);
     }
 
     let d3d = SharedD3DDevice::new()?;
-    let capture = WgcCapture::start(&d3d, CaptureTarget::PrimaryMonitor, true)?;
+    let capture = FrameCapture::start(&d3d, CaptureTarget::PrimaryMonitor, true, prefer_dxgi)?;
+    let (init_w, init_h) = capture.initial_size();
 
     let (out_w, out_h) = video_config.resolution.dimensions();
     let mut converter = GpuNv12Converter::new(
         &d3d,
-        capture.initial_size.Width as u32,
-        capture.initial_size.Height as u32,
+        init_w,
+        init_h,
         out_w,
         out_h,
         video_config.fps.as_u32(),
@@ -253,9 +270,14 @@ fn run_av_clip_test(
         replay_buffer.push_video(pkt);
     }
 
-    let received = capture.stats.frames_received.load(Ordering::Relaxed);
-    let replaced = capture.stats.frames_replaced.load(Ordering::Relaxed);
-    info!(received, replaced, encoded_cfr_frames = frame_idx, "Prueba CLI CFR finalizada");
+    let (received, replaced) = capture.stats_counts();
+    info!(
+        backend = capture.backend_label(),
+        received,
+        replaced,
+        encoded_cfr_frames = frame_idx,
+        "Prueba CLI CFR finalizada"
+    );
 
     let snapshot = replay_buffer
         .snapshot(Some(replay_duration.as_secs()))
