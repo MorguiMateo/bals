@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
     ICodecAPI, IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator,
@@ -22,7 +23,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFMediaType_Video,
     MFSampleExtension_CleanPoint, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Main,
+    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::VARIANT;
@@ -122,7 +124,7 @@ impl H264Encoder {
             output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
             output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
             output_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
-            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
+            output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
             mft.SetOutputType(0, &output_type, 0)
         }
         .context("IMFTransform::SetOutputType (H.264) falló")?;
@@ -209,32 +211,32 @@ impl H264Encoder {
     }
 
     /// Envía una textura `ID3D11Texture2D` (`NV12`) en VRAM al encoder (Zero-Copy)
-    /// y devuelve los paquetes H.264 listos en este ciclo.
+    /// usando `rel_pts_100ns` comenzando desde `0` (óptimo para el rate-control de AMD/NVIDIA/Intel),
+    /// y devuelve los paquetes H.264 remapeados al reloj QPC absoluto (`qpc_origin_100ns + rel_pts`)
+    /// para sincronizar exactamente con el audio en el `ReplayBuffer`.
     pub fn encode_nv12_texture(
         &mut self,
         nv12_texture: &ID3D11Texture2D,
-        timestamp_100ns: i64,
+        rel_pts_100ns: i64,
+        qpc_origin_100ns: i64,
     ) -> Result<Vec<EncodedVideoPacket>> {
-        // Garantizar un Keyframe (IDR) cada `gop_secs` por tiempo real (no solo por conteo de frames),
-        // vital cuando WGC reduce los FPS en menús o pantallas estáticas.
+        // Garantizar un Keyframe (IDR) exacto cada `gop_secs` segundos.
         match self.last_forced_kf_ts {
             None => {
                 self.force_keyframe();
-                self.last_forced_kf_ts = Some(timestamp_100ns);
+                self.last_forced_kf_ts = Some(rel_pts_100ns);
             }
-            Some(prev) if timestamp_100ns.saturating_sub(prev) >= self.gop_duration_100ns => {
+            Some(prev) if rel_pts_100ns.saturating_sub(prev) >= self.gop_duration_100ns => {
                 self.force_keyframe();
-                self.last_forced_kf_ts = Some(timestamp_100ns);
+                self.last_forced_kf_ts = Some(rel_pts_100ns);
             }
             _ => {}
         }
 
-        let sample = create_sample_from_texture(nv12_texture, timestamp_100ns, self.frame_duration_100ns)?;
+        let sample = create_sample_from_texture(nv12_texture, rel_pts_100ns, self.frame_duration_100ns)?;
         let mut packets = Vec::new();
 
         if self.is_async {
-            // En MFT asíncrono debemos esperar un METransformNeedInput antes de ProcessInput,
-            // drenando cualquier METransformHaveOutput que llegue mientras tanto para no bloquearnos.
             while self.pending_input_requests == 0 {
                 self.poll_async_event(false, &mut packets)?;
             }
@@ -243,7 +245,6 @@ impl H264Encoder {
             unsafe { self.mft.ProcessInput(0, &sample, 0) }
                 .context("ProcessInput (async MFT) falló")?;
 
-            // Drenar todas las salidas que ya estén disponibles sin bloquear.
             while self.poll_async_event(true, &mut packets)? {}
         } else {
             unsafe { self.mft.ProcessInput(0, &sample, 0) }
@@ -257,11 +258,16 @@ impl H264Encoder {
             }
         }
 
+        for pkt in &mut packets {
+            pkt.pts_100ns = qpc_origin_100ns.saturating_add(pkt.pts_100ns);
+            pkt.duration_100ns = self.frame_duration_100ns;
+        }
+
         Ok(packets)
     }
 
     /// Drena todos los frames pendientes dentro del encoder al detener una sesión.
-    pub fn flush(&mut self) -> Result<Vec<EncodedVideoPacket>> {
+    pub fn flush(&mut self, qpc_origin_100ns: i64) -> Result<Vec<EncodedVideoPacket>> {
         let mut packets = Vec::new();
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -287,6 +293,11 @@ impl H264Encoder {
             while let Some(pkt) = self.pull_output_packet()? {
                 packets.push(pkt);
             }
+        }
+
+        for pkt in &mut packets {
+            pkt.pts_100ns = qpc_origin_100ns.saturating_add(pkt.pts_100ns);
+            pkt.duration_100ns = self.frame_duration_100ns;
         }
 
         Ok(packets)
@@ -506,14 +517,21 @@ fn configure_codec_api(mft: &IMFTransform, config: VideoConfig) {
 
     set_u32(
         &CODECAPI_AVEncCommonRateControlMode,
-        eAVEncCommonRateControlMode_CBR.0 as u32,
-        "RateControlMode=CBR",
+        eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
+        "RateControlMode=PeakConstrainedVBR",
     );
     set_u32(
         &CODECAPI_AVEncCommonMeanBitRate,
         config.bitrate_bps,
         "MeanBitRate",
     );
+    set_u32(
+        &CODECAPI_AVEncCommonMaxBitRate,
+        config.bitrate_bps.saturating_mul(3) / 2,
+        "MaxBitRate",
+    );
+    // Equilibrio velocidad/calidad (50 = alta calidad con <1 ms en GPU moderna).
+    set_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 50, "QualityVsSpeed=50");
     set_u32(&CODECAPI_AVEncMPVGOPSize, config.gop_frames(), "GOPSize");
     // 0 B-frames: baja latencia, menos VRAM y PTS == DTS para muxing MP4 simple y fiable.
     set_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");

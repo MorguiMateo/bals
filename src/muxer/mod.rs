@@ -13,7 +13,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFAudioFormat_AAC, MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFCreateSinkWriterFromURL, MFMediaType_Audio, MFMediaType_Video, MFSampleExtension_CleanPoint,
     MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
-    MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+    MFVideoInterlace_Progressive, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::HSTRING;
@@ -124,7 +124,7 @@ fn write_mp4_inner(
         h264_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
         h264_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(fps, 1))?;
         h264_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u32_pair(1, 1))?;
-        h264_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
+        h264_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
 
         if let Some(sps_pps) = &snapshot.sps_pps_annexb {
             h264_type.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, sps_pps)?;

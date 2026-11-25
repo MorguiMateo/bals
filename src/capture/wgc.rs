@@ -1,10 +1,9 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, TrySendError, bounded};
 use tracing::{debug, info, warn};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
@@ -37,41 +36,39 @@ impl SendWinRtDevice {
 #[derive(Default)]
 pub struct CaptureStats {
     pub frames_received: AtomicU64,
-    pub frames_dropped: AtomicU64,
+    pub frames_replaced: AtomicU64,
 }
 
-/// Sesión activa de Windows Graphics Capture (WGC).
-/// Al hacer `drop` detiene la captura y libera el FramePool automáticamente.
+/// Sesión activa de Windows Graphics Capture (WGC) con buzón de último frame ("latest-frame mailbox").
+///
+/// A diferencia de una cola FIFO, el buzón siempre conserva el frame más reciente de la GPU y
+/// devuelve inmediatamente los frames antiguos sin leer al FramePool de WGC. Esto elimina
+/// el *judder* en monitores de 120/144/240 Hz cuando se graba a 30 o 60 fps constantes (CFR).
 pub struct WgcCapture {
     frame_pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     _item: GraphicsCaptureItem,
     frame_arrived_token: i64,
     closed: Arc<AtomicBool>,
+    latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     pub stats: Arc<CaptureStats>,
-    pub rx: Receiver<CapturedFrame>,
     pub initial_size: SizeInt32,
 }
 
 impl WgcCapture {
     /// Inicia la captura Zero-Copy usando `CreateFreeThreaded` (sin requerir DispatcherQueue).
-    ///
-    /// - `capture_cursor`: incluir cursor del mouse en los clips.
-    /// - `channel_capacity`: tamaño máximo de la cola de frames en vuelo (recomendado: 2).
     pub fn start(
         d3d: &SharedD3DDevice,
         target: CaptureTarget,
         capture_cursor: bool,
-        channel_capacity: usize,
     ) -> Result<Self> {
         let item = create_capture_item(target)?;
         let initial_size = item
             .Size()
             .context("No se pudo obtener el tamaño inicial del GraphicsCaptureItem")?;
 
-        // Número de buffers en el FramePool = capacidad del canal + 1 para que WGC siempre
-        // tenga al menos una superficie libre mientras el encoder procesa la anterior.
-        let pool_buffers = (channel_capacity.max(1) + 1) as i32;
+        // 3 buffers en el FramePool: 1 en WGC, 1 en el buzón `latest_frame` y 1 en vuelo en el VideoProcessor.
+        let pool_buffers = 3;
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &d3d.winrt_device,
@@ -93,16 +90,17 @@ impl WgcCapture {
             debug!("SetIsCursorCaptureEnabled no soportado: {err}");
         }
 
-        let (tx, rx) = bounded::<CapturedFrame>(channel_capacity.max(1));
+        let latest_frame: Arc<Mutex<Option<CapturedFrame>>> = Arc::new(Mutex::new(None));
         let stats = Arc::new(CaptureStats::default());
         let closed = Arc::new(AtomicBool::new(false));
 
-        let last_size = Arc::new(std::sync::Mutex::new(initial_size));
+        let last_size = Arc::new(Mutex::new(initial_size));
         let winrt_device_clone = SendWinRtDevice(d3d.winrt_device.clone());
+        let latest_clone = Arc::clone(&latest_frame);
         let stats_clone = Arc::clone(&stats);
         let closed_clone = Arc::clone(&closed);
 
-        // Callback invocado en un hilo del threadpool de WinRT cada vez que hay un nuevo frame.
+        // Callback invocado en el threadpool de WinRT cada vez que la GPU presenta un nuevo frame.
         let handler = TypedEventHandler::<Direct3D11CaptureFramePool, windows::core::IInspectable>::new(
             move |sender, _| {
                 if closed_clone.load(Ordering::Relaxed) {
@@ -113,9 +111,18 @@ impl WgcCapture {
                     return Ok(());
                 };
 
-                let frame = match pool.TryGetNextFrame() {
-                    Ok(f) => f,
-                    Err(_) => return Ok(()),
+                // Drenar todos los frames acumulados quedándonos solo con el más reciente.
+                let mut freshest_frame = None;
+                while let Ok(f) = pool.TryGetNextFrame() {
+                    if freshest_frame.is_some() {
+                        stats_clone.frames_replaced.fetch_add(1, Ordering::Relaxed);
+                    }
+                    stats_clone.frames_received.fetch_add(1, Ordering::Relaxed);
+                    freshest_frame = Some(f);
+                }
+
+                let Some(frame) = freshest_frame else {
+                    return Ok(());
                 };
 
                 let content_size = match frame.ContentSize() {
@@ -152,7 +159,7 @@ impl WgcCapture {
                     .map(|ts| ts.Duration)
                     .unwrap_or(0);
 
-                // Extracción Zero-Copy de la ID3D11Texture2D directamente desde la superficie WinRT.
+                // Extracción Zero-Copy de la ID3D11Texture2D directamente desde VRAM.
                 let surface = match frame.Surface() {
                     Ok(s) => s,
                     Err(_) => return Ok(()),
@@ -166,8 +173,6 @@ impl WgcCapture {
                     Err(_) => return Ok(()),
                 };
 
-                stats_clone.frames_received.fetch_add(1, Ordering::Relaxed);
-
                 let captured = CapturedFrame::new(
                     texture,
                     content_size.Width as u32,
@@ -176,10 +181,12 @@ impl WgcCapture {
                     frame,
                 );
 
-                // Backpressure no bloqueante: si el encoder va saturado, descartamos este frame
-                // inmediatamente para no frenar el juego ni acumular RAM/VRAM.
-                if let Err(TrySendError::Full(_)) = tx.try_send(captured) {
-                    stats_clone.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                // Reemplazar atómicamente el frame pendiente: el frame viejo (si no se leyó aún)
+                // se descarta inmediatamente y vuelve al FramePool sin bloquear al juego.
+                if let Ok(mut slot) = latest_clone.lock() {
+                    if slot.replace(captured).is_some() {
+                        stats_clone.frames_replaced.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
 
                 Ok(())
@@ -198,7 +205,7 @@ impl WgcCapture {
             width = initial_size.Width,
             height = initial_size.Height,
             pool_buffers,
-            "Captura WGC iniciada (Zero-Copy GPU)"
+            "Captura WGC iniciada (Zero-Copy GPU · Mailbox último frame)"
         );
 
         Ok(Self {
@@ -207,14 +214,22 @@ impl WgcCapture {
             _item: item,
             frame_arrived_token,
             closed,
+            latest_frame,
             stats,
-            rx,
             initial_size,
         })
     }
 
+    /// Extrae el frame más reciente capturado por WGC (si llegó alguno desde el último tick).
+    pub fn take_latest(&self) -> Option<CapturedFrame> {
+        self.latest_frame.lock().ok()?.take()
+    }
+
     pub fn stop(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
+            if let Ok(mut slot) = self.latest_frame.lock() {
+                *slot = None;
+            }
             let _ = self.frame_pool.RemoveFrameArrived(self.frame_arrived_token);
             let _ = self.session.Close();
             let _ = self.frame_pool.Close();
@@ -234,7 +249,8 @@ fn create_capture_item(target: CaptureTarget) -> Result<GraphicsCaptureItem> {
 
     let item = match target {
         CaptureTarget::PrimaryMonitor => {
-            let hmonitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+            let hmonitor =
+                unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
             unsafe { interop.CreateForMonitor(hmonitor) }
                 .context("CreateForMonitor falló para el monitor principal")?
         }
@@ -251,13 +267,11 @@ fn create_capture_item(target: CaptureTarget) -> Result<GraphicsCaptureItem> {
     Ok(item)
 }
 
-/// Utilidad para obtener el HMONITOR del monitor principal.
 #[allow(dead_code)]
 pub fn primary_monitor() -> HMONITOR {
     unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) }
 }
 
-/// Utilidad para obtener la ventana activa en primer plano (útil para capturar juegos).
 #[allow(dead_code)]
 pub fn foreground_window() -> HWND {
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }

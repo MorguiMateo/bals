@@ -11,6 +11,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 use crate::config::{AppConfig, CaptureMode, FrameRate, ReplayDuration, Resolution, VideoConfig};
 use crate::hotkey::parse_hotkey;
 use crate::ipc;
+use crate::startup;
 use crate::trimmer::{TrimStats, probe_mp4_duration_secs, suggested_trim_output, trim_mp4_passthrough};
 use crate::updater::{self, CURRENT_VERSION, ReleaseInfo};
 
@@ -47,6 +48,7 @@ enum UpdateUiState {
 struct BalsUiApp {
     tab: Tab,
     cfg: AppConfig,
+    start_with_windows: bool,
     extra_games_text: String,
     hotkey_error: Option<String>,
     banner_msg: Option<(String, bool)>,
@@ -65,6 +67,7 @@ struct BalsUiApp {
 impl BalsUiApp {
     fn new() -> Self {
         let cfg = AppConfig::load_or_create();
+        let start_with_windows = startup::is_autostart_enabled();
         let extra_games_text = cfg.extra_game_exes.join(", ");
         let clips = scan_clips(&cfg.clips_dir);
         let daemon_running = ipc::is_daemon_running();
@@ -72,6 +75,7 @@ impl BalsUiApp {
         let mut app = Self {
             tab: Tab::Settings,
             cfg,
+            start_with_windows,
             extra_games_text,
             hotkey_error: None,
             banner_msg: None,
@@ -126,6 +130,11 @@ impl BalsUiApp {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+
+        if let Err(err) = startup::set_autostart_enabled(self.start_with_windows) {
+            self.banner_msg = Some((format!("Error configurando inicio con Windows: {err:#}"), true));
+            return;
+        }
 
         match self.cfg.save() {
             Ok(()) => {
@@ -455,6 +464,10 @@ impl BalsUiApp {
                     ui.checkbox(&mut self.cfg.sound_feedback, "Sonido al guardar clip");
                     ui.checkbox(&mut self.cfg.auto_update, "Actualizar automáticamente");
                 });
+                ui.checkbox(
+                    &mut self.start_with_windows,
+                    "Iniciar Bals automáticamente con Windows (en bandeja)",
+                );
             });
 
             ui.add_space(8.0);

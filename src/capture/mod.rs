@@ -23,6 +23,7 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     /// Marca de tiempo relativa del sistema en unidades de 100 nanosegundos (ticks de WinRT/MF).
+    #[allow(dead_code)]
     pub timestamp_100ns: i64,
     _wgc_frame: Direct3D11CaptureFrame,
 }

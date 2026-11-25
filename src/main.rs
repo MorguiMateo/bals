@@ -13,6 +13,7 @@ mod game_detect;
 mod hotkey;
 mod ipc;
 mod muxer;
+mod startup;
 mod tray;
 mod trimmer;
 mod ui;
@@ -156,8 +157,12 @@ fn run_av_clip_test(
     replay_duration: ReplayDuration,
     record_secs: u64,
 ) -> Result<()> {
+    unsafe {
+        windows::Win32::Media::timeBeginPeriod(1);
+    }
+
     let d3d = SharedD3DDevice::new()?;
-    let capture = WgcCapture::start(&d3d, CaptureTarget::PrimaryMonitor, true, 2)?;
+    let capture = WgcCapture::start(&d3d, CaptureTarget::PrimaryMonitor, true)?;
 
     let (out_w, out_h) = video_config.resolution.dimensions();
     let mut converter = GpuNv12Converter::new(
@@ -183,12 +188,12 @@ fn run_av_clip_test(
         }
     };
 
-    let frame_interval_100ns = video_config.fps.frame_duration_100ns();
-    let min_step_100ns = (frame_interval_100ns * 85) / 100;
-
+    let fps = video_config.fps.as_u32() as i64;
     let test_duration = Duration::from_secs(record_secs);
     let start = Instant::now();
-    let mut last_encoded_ts: Option<i64> = None;
+    let mut qpc_origin = clock::now_100ns();
+    let mut frame_idx = 0u64;
+    let mut last_nv12 = None;
 
     while start.elapsed() < test_duration {
         if let Some(audio) = &audio_pipeline {
@@ -197,24 +202,38 @@ fn run_av_clip_test(
             }
         }
 
-        match capture.rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(frame) => {
-                if let Some(prev) = last_encoded_ts {
-                    if frame.timestamp_100ns.saturating_sub(prev) < min_step_100ns {
-                        continue;
-                    }
-                }
-                last_encoded_ts = Some(frame.timestamp_100ns);
-
-                let nv12 = converter.convert(&frame.texture, frame.width, frame.height)?;
-                let pkts = encoder.encode_nv12_texture(&nv12, frame.timestamp_100ns)?;
-                for pkt in pkts {
-                    replay_buffer.push_video(pkt);
-                }
+        let target_rel = (frame_idx as i64 * 10_000_000) / fps;
+        let target_qpc = qpc_origin + target_rel;
+        loop {
+            let rem = target_qpc - clock::now_100ns();
+            if rem <= 0 {
+                break;
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            if rem > 15_000 {
+                std::thread::sleep(Duration::from_millis(((rem - 10_000) / 10_000).clamp(1, 8) as u64));
+            } else {
+                std::thread::yield_now();
+            }
         }
+
+        if let Some(frame) = capture.take_latest() {
+            let nv12 = converter.convert(&frame.texture, frame.width, frame.height)?;
+            last_nv12 = Some(nv12);
+        }
+
+        if let Some(nv12) = last_nv12.as_ref() {
+            let pkts = encoder.encode_nv12_texture(nv12, target_rel, qpc_origin)?;
+            for pkt in pkts {
+                replay_buffer.push_video(pkt);
+            }
+            frame_idx += 1;
+        } else {
+            qpc_origin = clock::now_100ns();
+        }
+    }
+
+    unsafe {
+        windows::Win32::Media::timeEndPeriod(1);
     }
 
     if let Some(mut audio) = audio_pipeline.take() {
@@ -224,13 +243,13 @@ fn run_av_clip_test(
         }
     }
 
-    for pkt in encoder.flush()? {
+    for pkt in encoder.flush(qpc_origin)? {
         replay_buffer.push_video(pkt);
     }
 
     let received = capture.stats.frames_received.load(Ordering::Relaxed);
-    let dropped = capture.stats.frames_dropped.load(Ordering::Relaxed);
-    info!(received, dropped, "Prueba CLI finalizada");
+    let replaced = capture.stats.frames_replaced.load(Ordering::Relaxed);
+    info!(received, replaced, encoded_cfr_frames = frame_idx, "Prueba CLI CFR finalizada");
 
     let snapshot = replay_buffer
         .snapshot(Some(replay_duration.as_secs()))
@@ -243,7 +262,9 @@ fn run_av_clip_test(
     info!(
         file = %stats.path.display(),
         size_kb = stats.file_bytes / 1024,
-        "Clip CLI generado"
+        video_packets = stats.video_packets_written,
+        duration_s = format!("{:.2}", stats.clip_duration_secs),
+        "Clip CLI CFR generado"
     );
 
     Ok(())

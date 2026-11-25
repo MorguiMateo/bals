@@ -63,7 +63,7 @@ jobs:
         if: steps.check_release.outputs.exists == 'false'
         run: cargo build --release --locked
 
-      - name: Package release artifacts
+      - name: Package release artifacts & Windows Installer
         if: steps.check_release.outputs.exists == 'false'
         shell: pwsh
         run: |
@@ -71,12 +71,28 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\bals.exe dist\bals.exe
 
+          # Compilar instalador Windows con Inno Setup (preinstalado en windows-latest)
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $defaultPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (Test-Path $defaultPath) { $iscc = Get-Item $defaultPath }
+          }
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DMyAppVersion=$ver" installer\bals.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          $setupPath = "dist\Bals-Setup-v$ver.exe"
           $zipPath = "dist\bals-v$ver-windows-x64.zip"
           Compress-Archive -Path dist\bals.exe, README.md -DestinationPath $zipPath -Force
 
+          $setupHash = (Get-FileHash $setupPath -Algorithm SHA256).Hash
           $exeHash = (Get-FileHash dist\bals.exe -Algorithm SHA256).Hash
           $zipHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
           @(
+            "$setupHash  Bals-Setup-v$ver.exe"
             "$exeHash  bals.exe"
             "$zipHash  bals-v$ver-windows-x64.zip"
           ) | Set-Content -Path "dist\bals-v$ver-windows-x64.sha256" -Encoding ascii
@@ -90,6 +106,7 @@ jobs:
           $ver = "${{ steps.meta.outputs.version }}"
           $tag = "${{ steps.meta.outputs.tag }}"
           gh release create $tag `
+            "dist\Bals-Setup-v$ver.exe" `
             dist\bals.exe `
             "dist\bals-v$ver-windows-x64.zip" `
             "dist\bals-v$ver-windows-x64.sha256" `

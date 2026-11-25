@@ -17,7 +17,7 @@ use windows::core::Interface;
 
 use crate::d3d::SharedD3DDevice;
 
-const NV12_POOL_SIZE: usize = 6;
+const NV12_POOL_SIZE: usize = 8;
 
 struct Nv12Slot {
     texture: ID3D11Texture2D,
@@ -176,6 +176,12 @@ impl GpuNv12Converter {
         }
 
         blt_res.context("VideoProcessorBlt (BGRA -> NV12) falló")?;
+
+        // Enviar inmediatamente la cola de comandos D3D11 a la GPU para garantizar que la escritura
+        // en la textura NV12 quede encolada ANTES de que el encoder hardware (VCE/NVENC/QSV) la lea.
+        unsafe {
+            self.d3d.context.Flush();
+        }
 
         Ok(slot.texture.clone())
     }

@@ -16,9 +16,10 @@ Cliper de videojuegos ultra-liviano para **Windows 10/11**, escrito en **Rust** 
 - **Interfaz liviana bajo demanda (`eframe` + `glow`):** Al cerrar la ventana, el proceso `--ui` finaliza y libera el **100% de su RAM y contexto gráfico**, quedando solo el icono nativo en la bandeja del sistema.
 - **Recortador MP4 sin pérdida:** Recorta tus clips desde la pestaña *Clips y Recortador* en milisegundos y sin recodificar (`IMFSourceReader` → `IMFSinkWriter` en passthrough).
 
-## Uso
+## Instalación y Uso
 
-- **Abrir Bals (bandeja + ventana de ajustes y clips):**
+- **Instalador Windows (Recomendado):** Descarga `Bals-Setup-vX.Y.Z.exe` desde [Releases](https://github.com/sconelli24/bals/releases/latest). Instala en `%LOCALAPPDATA%\Programs\Bals` sin pedir permisos de administrador, crea acceso directo en el **Menú de Inicio** y ofrece arranque automático con Windows.
+- **Versión portable:** Descarga `bals.exe` y ejecútalo directamente:
   ```powershell
   .\bals.exe
   ```
