@@ -8,7 +8,10 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
 
-use crate::config::{AppConfig, CaptureMode, FrameRate, ReplayDuration, Resolution, VideoConfig};
+use crate::audio::meter::AudioLevelMonitor;
+use crate::config::{
+    AppConfig, AudioCaptureMode, CaptureMode, FrameRate, ReplayDuration, Resolution, VideoConfig,
+};
 use crate::hotkey::parse_hotkey;
 use crate::ipc;
 use crate::startup;
@@ -54,6 +57,7 @@ struct BalsUiApp {
     banner_msg: Option<(String, bool)>,
     daemon_running: bool,
     update_state: Arc<Mutex<UpdateUiState>>,
+    audio_meter: AudioLevelMonitor,
 
     // Galería y recortador
     clips: Vec<ClipEntry>,
@@ -81,6 +85,7 @@ impl BalsUiApp {
             banner_msg: None,
             daemon_running,
             update_state: Arc::new(Mutex::new(UpdateUiState::Idle)),
+            audio_meter: AudioLevelMonitor::start(),
             clips,
             selected_clip: None,
             selected_duration: None,
@@ -472,27 +477,69 @@ impl BalsUiApp {
 
             ui.add_space(8.0);
 
-            // 3. Audio
+            // 3. Audio + Medidores VU en tiempo real
             ui.group(|ui| {
                 ui.strong("Audio (WASAPI 48 kHz AAC-LC)");
                 ui.add_space(6.0);
 
+                ui.horizontal(|ui| {
+                    ui.label("Audio a grabar:");
+                    ui.selectable_value(
+                        &mut self.cfg.audio_capture_mode,
+                        AudioCaptureMode::FullDesktop,
+                        "Todo el escritorio (juego + Discord + música)",
+                    );
+                    ui.selectable_value(
+                        &mut self.cfg.audio_capture_mode,
+                        AudioCaptureMode::GameOnly,
+                        "Solo el juego detectado",
+                    );
+                });
+
+                ui.add_space(6.0);
+
+                // Juego / Escritorio + barra VU en vivo
+                let desktop_lvl = (self.audio_meter.desktop_level() * self.cfg.game_volume).min(1.0);
+                ui.horizontal(|ui| {
+                    ui.label("Juego / Escritorio:");
+                    let mut pct = (self.cfg.game_volume * 100.0).round();
+                    if ui
+                        .add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%"))
+                        .changed()
+                    {
+                        self.cfg.game_volume = pct / 100.0;
+                    }
+                });
+                draw_vu_meter(ui, desktop_lvl, "Nivel juego / escritorio");
+
+                ui.add_space(6.0);
                 ui.checkbox(
                     &mut self.cfg.mic_enabled,
-                    "Grabar micrófono mezclado con el audio del juego",
+                    "Grabar micrófono mezclado con el audio",
                 );
 
-                ui.horizontal(|ui| {
-                    ui.label("Volumen juego/sistema:");
-                    ui.add(egui::Slider::new(&mut self.cfg.game_volume, 0.0..=1.5).fixed_decimals(2));
-                });
-
+                let mic_lvl = if self.cfg.mic_enabled {
+                    (self.audio_meter.mic_level() * self.cfg.mic_volume).min(1.0)
+                } else {
+                    0.0
+                };
                 ui.add_enabled_ui(self.cfg.mic_enabled, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Volumen micrófono:    ");
-                        ui.add(egui::Slider::new(&mut self.cfg.mic_volume, 0.0..=1.5).fixed_decimals(2));
+                        ui.label("Micrófono:         ");
+                        let mut pct = (self.cfg.mic_volume * 100.0).round();
+                        if ui
+                            .add(egui::Slider::new(&mut pct, 0.0..=200.0).suffix("%"))
+                            .changed()
+                        {
+                            self.cfg.mic_volume = pct / 100.0;
+                        }
                     });
+                    draw_vu_meter(ui, mic_lvl, "Nivel micrófono");
                 });
+
+                // Refrescar ~30 veces por segundo mientras el usuario mira los niveles de audio.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(33));
             });
 
             ui.add_space(8.0);
@@ -734,6 +781,38 @@ impl BalsUiApp {
             });
         });
     }
+}
+
+fn draw_vu_meter(ui: &mut egui::Ui, level: f32, tooltip: &str) {
+    let desired = egui::vec2(ui.available_width().min(420.0), 10.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter();
+
+    // Fondo oscuro de la barra
+    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(35));
+
+    let clamped = level.clamp(0.0, 1.0);
+    if clamped > 0.005 {
+        let fill_w = rect.width() * clamped;
+        let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
+        let color = if clamped > 0.88 {
+            egui::Color32::from_rgb(239, 68, 68) // rojo (saturación)
+        } else if clamped > 0.65 {
+            egui::Color32::from_rgb(245, 158, 11) // ámbar (alto)
+        } else {
+            egui::Color32::from_rgb(16, 185, 129) // verde esmeralda (óptimo)
+        };
+        painter.rect_filled(fill_rect, 3.0, color);
+    }
+
+    // Marcas de referencia sutiles (50% y 85%)
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(65));
+    for frac in [0.50f32, 0.85f32] {
+        let x = rect.left() + rect.width() * frac;
+        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+    }
+
+    response.on_hover_text(format!("{tooltip}: {:.0}%", clamped * 100.0));
 }
 
 fn scan_clips(dir: &Path) -> Vec<ClipEntry> {

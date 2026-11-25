@@ -15,7 +15,7 @@ use crate::buffer::ReplayBuffer;
 use crate::capture::CaptureTarget;
 use crate::capture::wgc::WgcCapture;
 use crate::clock;
-use crate::config::{AppConfig, AudioSource, CaptureMode, VideoConfig};
+use crate::config::{AppConfig, AudioCaptureMode, AudioSource, CaptureMode, VideoConfig};
 use crate::d3d::SharedD3DDevice;
 use crate::encode::h264_mft::H264Encoder;
 use crate::encode::video_processor::GpuNv12Converter;
@@ -347,6 +347,7 @@ fn engine_loop(
                     let needs_restart = new_cfg.resolution != cfg.resolution
                         || new_cfg.fps != cfg.fps
                         || new_cfg.replay_duration != cfg.replay_duration
+                        || new_cfg.audio_capture_mode != cfg.audio_capture_mode
                         || new_cfg.mic_enabled != cfg.mic_enabled
                         || new_cfg.capture_cursor != cfg.capture_cursor
                         || (new_cfg.game_volume - cfg.game_volume).abs() > 0.001
@@ -485,10 +486,18 @@ fn poll_game_autodetect(
         exe_name,
     }) = detect_foreground_game(&cfg.extra_game_exes)
     {
-        info!(game = %exe_name, pid, "Juego detectado automáticamente; iniciando Replay Buffer CFR");
-        let audio_src = AudioSource::ProcessLoopback {
+        info!(
+            game = %exe_name,
             pid,
-            include_tree: true,
+            audio_mode = ?cfg.audio_capture_mode,
+            "Juego detectado automáticamente; iniciando Replay Buffer CFR"
+        );
+        let audio_src = match cfg.audio_capture_mode {
+            AudioCaptureMode::GameOnly => AudioSource::ProcessLoopback {
+                pid,
+                include_tree: true,
+            },
+            AudioCaptureMode::FullDesktop => AudioSource::SystemLoopback,
         };
         let state = RecordingState::RecordingGame {
             exe_name: exe_name.clone(),

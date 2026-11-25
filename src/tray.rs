@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-use crate::config::{AppConfig, CaptureMode, FrameRate, ReplayDuration, Resolution};
+use crate::config::{AppConfig, AudioCaptureMode, CaptureMode, FrameRate, ReplayDuration, Resolution};
 use crate::engine::{EngineCommand, EngineEvent, EngineStatus, RecordingState};
 use crate::hotkey::parse_hotkey;
 use crate::ipc::{
@@ -52,6 +52,7 @@ const IDM_DUR_30: usize = 1031;
 const IDM_DUR_60: usize = 1032;
 const IDM_DUR_120: usize = 1033;
 const IDM_TOGGLE_MIC: usize = 1040;
+const IDM_TOGGLE_FULL_AUDIO: usize = 1041;
 const IDM_OPEN_CLIPS: usize = 1050;
 const IDM_OPEN_CONFIG: usize = 1051;
 const IDM_EXIT: usize = 1099;
@@ -375,6 +376,13 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
                 st.cfg.mic_enabled = !st.cfg.mic_enabled;
                 config_changed = true;
             }
+            IDM_TOGGLE_FULL_AUDIO => {
+                st.cfg.audio_capture_mode = match st.cfg.audio_capture_mode {
+                    AudioCaptureMode::FullDesktop => AudioCaptureMode::GameOnly,
+                    AudioCaptureMode::GameOnly => AudioCaptureMode::FullDesktop,
+                };
+                config_changed = true;
+            }
             IDM_OPEN_CLIPS => {
                 let _ = std::fs::create_dir_all(&st.cfg.clips_dir);
                 open_in_shell(&st.cfg.clips_dir);
@@ -528,6 +536,12 @@ fn show_context_menu(hwnd: HWND) {
                 let _ = AppendMenuW(menu, MF_POPUP, sub_dur.0 as usize, &label);
             }
 
+            append_checked(
+                menu,
+                st.cfg.audio_capture_mode == AudioCaptureMode::FullDesktop,
+                IDM_TOGGLE_FULL_AUDIO,
+                "Grabar audio de todo el escritorio",
+            );
             append_checked(menu, st.cfg.mic_enabled, IDM_TOGGLE_MIC, "Grabar micrófono");
 
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());

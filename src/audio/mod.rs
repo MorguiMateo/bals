@@ -1,5 +1,6 @@
 pub mod aac_mft;
 pub mod capture;
+pub mod meter;
 
 use std::sync::{
     Arc,

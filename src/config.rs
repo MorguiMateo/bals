@@ -199,6 +199,15 @@ pub enum CaptureMode {
     ManualMonitor,
 }
 
+/// Modo de captura de audio cuando se graba un juego.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCaptureMode {
+    /// Captura únicamente el audio del juego detectado (excluye Discord, música, navegador).
+    GameOnly,
+    /// Captura todo el audio del escritorio (juego + Discord + música + sistema).
+    FullDesktop,
+}
+
 /// Configuración persistente de Bals guardada en `%APPDATA%\Bals\config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -209,6 +218,7 @@ pub struct AppConfig {
     /// Atajo global para guardar los últimos N segundos (por defecto `\`).
     pub save_clip_hotkey: String,
     pub capture_mode: CaptureMode,
+    pub audio_capture_mode: AudioCaptureMode,
     pub mic_enabled: bool,
     pub game_volume: f32,
     pub mic_volume: f32,
@@ -231,6 +241,7 @@ impl Default for AppConfig {
             replay_duration: ReplayDuration::Sec30,
             save_clip_hotkey: "\\".to_string(),
             capture_mode: CaptureMode::AutoDetectGames,
+            audio_capture_mode: AudioCaptureMode::FullDesktop,
             mic_enabled: true,
             game_volume: 1.0,
             mic_volume: 1.0,
