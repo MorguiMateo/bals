@@ -46,8 +46,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = "${{ steps.meta.outputs.tag }}"
-          gh release view $tag 2>$null | Out-Null
+          gh release view $tag --repo "${{ github.repository }}" *> $null
           if ($LASTEXITCODE -eq 0) {
             "exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host "Release $tag already exists. Skipping release publish (bump version in Cargo.toml to publish a new release)."
@@ -55,6 +57,7 @@ jobs:
             "exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host "Release $tag does not exist yet. Will build and publish!"
           }
+          exit 0
 
       - name: Build release binary
         if: steps.check_release.outputs.exists == 'false'
