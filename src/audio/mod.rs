@@ -270,3 +270,24 @@ fn drain_or_silence(
         out[available..].fill(0.0);
     }
 }
+
+/// WAV PCM embebido (alineado a 4 bytes) para el sonido personalizado al guardar un clip.
+#[repr(C, align(4))]
+struct AlignedWav<const N: usize>([u8; N]);
+
+static CLIP_SAVED_WAV: AlignedWav<{ include_bytes!("../../assets/clip_saved.wav").len() }> =
+    AlignedWav(*include_bytes!("../../assets/clip_saved.wav"));
+
+/// Reproduce de forma asíncrona (no bloqueante) el sonido retro CRT al guardar un clip.
+pub fn play_clip_saved_sound() {
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let _ = PlaySoundW(
+            PCWSTR(CLIP_SAVED_WAV.0.as_ptr() as *const u16),
+            None,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        );
+    }
+}

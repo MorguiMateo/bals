@@ -18,8 +18,9 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::audio::meter::AudioLevelMonitor;
 use crate::capture::{MonitorInfo, list_monitors};
-use crate::config::{AppConfig, UiTheme};
+use crate::config::{AppConfig, EncoderPreference, UiTheme};
 use crate::encode::h264_mft::{DetectedEncoders, detect_system_encoders};
+use crate::game_detect::{RunningApp, list_running_window_apps};
 use crate::hotkey::parse_hotkey;
 use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
@@ -74,9 +75,11 @@ pub(crate) struct BalsUiApp {
     pub cfg: AppConfig,
     pub applied_theme: Option<UiTheme>,
     pub start_with_windows: bool,
-    pub extra_games_text: String,
     pub hotkey_error: Option<String>,
     pub listening_hotkey: bool,
+    pub show_exe_picker: bool,
+    pub running_apps: Vec<RunningApp>,
+    pub exe_picker_filter: String,
     pub banner_msg: Option<(String, bool, Instant)>,
 
     // Estado en vivo del daemon vía memoria compartida
@@ -120,14 +123,18 @@ pub(crate) struct BalsUiApp {
 
 impl BalsUiApp {
     fn new(ctx: &egui::Context) -> Self {
-        let cfg = AppConfig::load_or_create();
+        let mut cfg = AppConfig::load_or_create();
         let start_with_windows = startup::is_autostart_enabled();
-        let extra_games_text = cfg.extra_game_exes.join(", ");
         let clips = scan_clips(&cfg.clips_dir);
         let daemon_running = ipc::is_daemon_running();
         let telemetry = ipc::read_engine_telemetry();
         let last_clip_event_seq = telemetry.as_ref().map_or(0, |t| t.clip_event_seq);
         let detected_encoders = detect_system_encoders();
+        if cfg.encoder_pref == EncoderPreference::HardwareGpu
+            && detected_encoders.hw_name.is_none()
+        {
+            cfg.encoder_pref = EncoderPreference::SoftwareCpu;
+        }
         let monitors = list_monitors();
 
         // Cargar ícono CRT 64×64 pixel-art con filtrado NEAREST (sin blur).
@@ -144,9 +151,11 @@ impl BalsUiApp {
             cfg,
             applied_theme: None,
             start_with_windows,
-            extra_games_text,
             hotkey_error: None,
             listening_hotkey: false,
+            show_exe_picker: false,
+            running_apps: Vec::new(),
+            exe_picker_filter: String::new(),
             banner_msg: None,
             daemon_running,
             telemetry,
@@ -186,6 +195,48 @@ impl BalsUiApp {
 
     pub fn set_banner(&mut self, msg: impl Into<String>, is_err: bool) {
         self.banner_msg = Some((msg.into(), is_err, Instant::now()));
+    }
+
+    /// Activa o desactiva la captura de una nueva hotkey pausando temporalmente la hotkey global
+    /// del daemon para que presionar la tecla actual no dispare un clip.
+    pub fn set_listening_hotkey(&mut self, listening: bool) {
+        if self.listening_hotkey == listening {
+            return;
+        }
+        self.listening_hotkey = listening;
+        if listening {
+            ipc::notify_pause_hotkey();
+        } else {
+            ipc::notify_resume_hotkey();
+        }
+    }
+
+    pub fn open_exe_picker(&mut self) {
+        self.set_listening_hotkey(false);
+        self.refresh_running_apps();
+        self.exe_picker_filter.clear();
+        self.show_exe_picker = true;
+    }
+
+    pub fn refresh_running_apps(&mut self) {
+        self.running_apps = list_running_window_apps();
+    }
+
+    pub fn toggle_extra_exe(&mut self, exe: &str) {
+        let trimmed = exe.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(idx) = self
+            .cfg
+            .extra_game_exes
+            .iter()
+            .position(|g| g.eq_ignore_ascii_case(trimmed))
+        {
+            self.cfg.extra_game_exes.remove(idx);
+        } else {
+            self.cfg.extra_game_exes.push(trimmed.to_string());
+        }
     }
 
     pub fn refresh_monitors(&mut self) {
@@ -269,14 +320,7 @@ impl BalsUiApp {
             return;
         }
         self.hotkey_error = None;
-        self.listening_hotkey = false;
-
-        self.cfg.extra_game_exes = self
-            .extra_games_text
-            .split([',', ';', '\n'])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        self.set_listening_hotkey(false);
 
         if let Err(err) = startup::set_autostart_enabled(self.start_with_windows) {
             self.set_banner(format!("Error configurando inicio Windows: {err:#}"), true);
@@ -396,7 +440,8 @@ impl BalsUiApp {
                 }
             };
             ipc::notify_shutdown();
-            std::thread::sleep(Duration::from_millis(300));
+            // Esperar a que el daemon libere la ventana de bandeja, GPU y hotkey antes de relanzar.
+            let _ = ipc::wait_until_daemon_stopped(Duration::from_secs(4));
             match updater::apply_downloaded_update(&bytes, &info, &[]) {
                 Ok(()) => std::process::exit(0),
                 Err(err) => {
@@ -536,9 +581,12 @@ impl BalsUiApp {
             (self.mic_vu_display - decay).max(m_raw)
         };
 
-        // Pausar cadencia alta del VU cuando la ventana pierde foco.
+        // Pausar cadencia alta del VU cuando la ventana pierde foco (y restaurar hotkey si se escuchaba).
         let focused = ctx.input(|i| i.focused);
         self.audio_meter.set_paused(!focused);
+        if !focused && self.listening_hotkey {
+            self.set_listening_hotkey(false);
+        }
 
         running_op
     }
@@ -567,7 +615,7 @@ impl BalsUiApp {
             });
 
             if let Some(res) = captured {
-                self.listening_hotkey = false;
+                self.set_listening_hotkey(false);
                 if let Some(spec) = res {
                     self.cfg.save_clip_hotkey = spec;
                     self.hotkey_error = parse_hotkey(&self.cfg.save_clip_hotkey)
@@ -575,6 +623,11 @@ impl BalsUiApp {
                         .map(|e| format!("{e}"));
                 }
             }
+            return;
+        }
+
+        // No disparar atajos de pestañas mientras el selector modal de `.exe` esté abierto.
+        if self.show_exe_picker {
             return;
         }
 
@@ -606,6 +659,7 @@ impl BalsUiApp {
             self.tab = Tab::Settings;
         }
         if switch_clips {
+            self.set_listening_hotkey(false);
             if self.tab != Tab::Clips {
                 self.refresh_clips();
             }
@@ -725,6 +779,7 @@ impl eframe::App for BalsUiApp {
                     if hardware_tab_button(ui, &p, self.tab == Tab::Clips, "R1", &clips_lbl)
                         .clicked()
                     {
+                        self.set_listening_hotkey(false);
                         self.tab = Tab::Clips;
                         self.refresh_clips();
                     }
@@ -838,7 +893,7 @@ impl eframe::App for BalsUiApp {
 
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new("[Q/E] PESTAÑAS · [CTRL+S] APLICAR · [F5] REC")
+                            egui::RichText::new("[Q/E] PESTAÑAS · [CTRL+S] GUARDAR · [F5] REC")
                                 .size(10.5)
                                 .color(p.chassis_muted),
                         );
@@ -919,6 +974,14 @@ impl eframe::App for BalsUiApp {
                     draw_scanlines(ui.painter(), crt_rect.shrink(4.0), p.crt_scanline);
                 }
             });
+    }
+}
+
+impl Drop for BalsUiApp {
+    fn drop(&mut self) {
+        if self.listening_hotkey {
+            ipc::notify_resume_hotkey();
+        }
     }
 }
 

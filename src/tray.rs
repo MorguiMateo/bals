@@ -1,26 +1,25 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDI_APPLICATION,
-    LoadIconW, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
-    MSG, PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW,
+    LoadIconW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    PostQuitMessage, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -30,8 +29,9 @@ use crate::config::{
 use crate::engine::{EngineCommand, EngineEvent, EngineStatus, RecordingState};
 use crate::hotkey::parse_hotkey;
 use crate::ipc::{
-    TRAY_WINDOW_CLASS, WM_BALS_RELOAD_CONFIG, WM_BALS_SAVE_CLIP, WM_BALS_SHUTDOWN,
-    WM_BALS_TOGGLE_RECORD, close_ui_window, spawn_or_focus_ui,
+    TRAY_WINDOW_CLASS, WM_BALS_CHECK_UPDATE, WM_BALS_PAUSE_HOTKEY, WM_BALS_RELOAD_CONFIG,
+    WM_BALS_RESUME_HOTKEY, WM_BALS_SAVE_CLIP, WM_BALS_SHUTDOWN, WM_BALS_TOGGLE_RECORD,
+    close_ui_window, spawn_or_focus_ui,
 };
 
 const WM_TRAY_ICON: u32 = WM_APP + 1;
@@ -66,9 +66,12 @@ struct TrayState {
     hwnd: HWND,
     cfg: AppConfig,
     hotkey_registered: bool,
+    hotkey_paused: bool,
+    hotkey_resumed_at: Option<Instant>,
     cmd_tx: Sender<EngineCommand>,
     event_rx: Receiver<EngineEvent>,
     status: Arc<Mutex<EngineStatus>>,
+    update_check_tx: Sender<()>,
     icon_idle: HICON,
     icon_rec: HICON,
     custom_icons: bool,
@@ -85,6 +88,7 @@ pub fn run_tray_loop(
     cmd_tx: Sender<EngineCommand>,
     event_rx: Receiver<EngineEvent>,
     status: Arc<Mutex<EngineStatus>>,
+    update_check_tx: Sender<()>,
 ) -> Result<()> {
     let hinstance = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW falló")?;
     let class_name = TRAY_WINDOW_CLASS;
@@ -135,9 +139,12 @@ pub fn run_tray_loop(
             hwnd,
             cfg: cfg.clone(),
             hotkey_registered,
+            hotkey_paused: false,
+            hotkey_resumed_at: None,
             cmd_tx,
             event_rx,
             status,
+            update_check_tx,
             icon_idle,
             icon_rec,
             custom_icons,
@@ -189,6 +196,15 @@ unsafe extern "system" fn wnd_proc(
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_SAVE_CLIP_ID => {
             TRAY_STATE.with(|slot| {
                 if let Some(st) = slot.borrow().as_ref() {
+                    if st.hotkey_paused {
+                        return;
+                    }
+                    if st
+                        .hotkey_resumed_at
+                        .is_some_and(|t| t.elapsed() < Duration::from_millis(220))
+                    {
+                        return;
+                    }
                     info!(hotkey = %st.cfg.save_clip_hotkey, "Hotkey presionada -> Guardando clip...");
                     let _ = st.cmd_tx.send(EngineCommand::SaveClip);
                 }
@@ -203,7 +219,14 @@ unsafe extern "system" fn wnd_proc(
             let event = (lparam.0 & 0xFFFF) as u32;
             match event {
                 WM_RBUTTONUP => show_context_menu(hwnd),
-                WM_LBUTTONDBLCLK => spawn_or_focus_ui(),
+                WM_LBUTTONDBLCLK => {
+                    spawn_or_focus_ui();
+                    TRAY_STATE.with(|slot| {
+                        if let Some(st) = slot.borrow().as_ref() {
+                            let _ = st.update_check_tx.try_send(());
+                        }
+                    });
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -214,8 +237,10 @@ unsafe extern "system" fn wnd_proc(
                     let mut new_cfg = AppConfig::load_or_create();
                     let prev_hotkey = st.cfg.save_clip_hotkey.clone();
                     let hotkey_changed = new_cfg.save_clip_hotkey != prev_hotkey;
+                    let was_paused = st.hotkey_paused;
+                    st.hotkey_paused = false;
 
-                    if hotkey_changed || !st.hotkey_registered {
+                    if hotkey_changed || !st.hotkey_registered || was_paused {
                         unsafe {
                             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID);
                         }
@@ -243,6 +268,7 @@ unsafe extern "system" fn wnd_proc(
                                         new_cfg.save_clip_hotkey
                                     ),
                                     true,
+                                    false,
                                 );
                             }
                         }
@@ -286,6 +312,41 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_BALS_CHECK_UPDATE => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow().as_ref() {
+                    let _ = st.update_check_tx.try_send(());
+                }
+            });
+            LRESULT(0)
+        }
+        WM_BALS_PAUSE_HOTKEY => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow_mut().as_mut() {
+                    if !st.hotkey_paused {
+                        unsafe {
+                            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SAVE_CLIP_ID);
+                        }
+                        st.hotkey_paused = true;
+                        st.hotkey_registered = false;
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_BALS_RESUME_HOTKEY => {
+            TRAY_STATE.with(|slot| {
+                if let Some(st) = slot.borrow_mut().as_mut() {
+                    if st.hotkey_paused {
+                        st.hotkey_paused = false;
+                        st.hotkey_registered =
+                            register_save_hotkey(hwnd, &st.cfg.save_clip_hotkey).is_ok();
+                        st.hotkey_resumed_at = Some(Instant::now());
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let cmd_id = wparam.0 & 0xFFFF;
             handle_menu_command(hwnd, cmd_id);
@@ -310,9 +371,7 @@ fn process_engine_events() {
             match ev {
                 EngineEvent::ClipSaved(stats) => {
                     if st.cfg.sound_feedback {
-                        unsafe {
-                            let _ = MessageBeep(MB_OK);
-                        }
+                        crate::audio::play_clip_saved_sound();
                     }
                     let mb = stats.file_bytes as f64 / (1024.0 * 1024.0);
                     let filename = stats
@@ -325,10 +384,11 @@ fn process_engine_events() {
                         "Bals — Clip guardado",
                         &format!("{filename} ({:.1} s · {:.1} MB)", stats.clip_duration_secs, mb),
                         false,
+                        true,
                     );
                 }
                 EngineEvent::ClipFailed(reason) => {
-                    show_balloon(st.hwnd, "Bals", &reason, true);
+                    show_balloon(st.hwnd, "Bals", &reason, true, false);
                 }
                 EngineEvent::StatusChanged(status) => {
                     refresh_tray_icon_for_status(st, &status);
@@ -348,7 +408,10 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
         let mut config_changed = false;
 
         match cmd_id {
-            IDM_OPEN_UI => spawn_or_focus_ui(),
+            IDM_OPEN_UI => {
+                spawn_or_focus_ui();
+                let _ = st.update_check_tx.try_send(());
+            }
             IDM_SAVE_CLIP => {
                 let _ = st.cmd_tx.send(EngineCommand::SaveClip);
             }
@@ -751,13 +814,17 @@ fn update_tray_icon(hwnd: HWND, icon: HICON, tooltip: &str) {
     }
 }
 
-fn show_balloon(hwnd: HWND, title: &str, body: &str, is_warning: bool) {
+fn show_balloon(hwnd: HWND, title: &str, body: &str, is_warning: bool, silent: bool) {
+    let mut flags = if is_warning { NIIF_WARNING } else { NIIF_INFO };
+    if silent {
+        flags |= NIIF_NOSOUND;
+    }
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ICON_UID,
         uFlags: NIF_INFO,
-        dwInfoFlags: if is_warning { NIIF_WARNING } else { NIIF_INFO },
+        dwInfoFlags: flags,
         ..Default::default()
     };
     copy_utf16(&mut nid.szInfoTitle, title);

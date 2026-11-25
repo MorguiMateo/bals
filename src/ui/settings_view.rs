@@ -1,23 +1,24 @@
 use std::path::PathBuf;
 
-use eframe::egui::{self, Sense, Stroke, StrokeKind, vec2};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::config::{
     AudioCaptureMode, CaptureMode, EncoderPreference, FrameRate, QualityPreset, ReplayDuration,
     Resolution, UiTheme, VideoConfig,
 };
-use crate::hotkey::parse_hotkey;
 use crate::ui::theme::RetroPalette;
-use crate::ui::widgets::{draw_led_vu_meter, retro_card, retro_checkbox, retro_pill};
+use crate::ui::widgets::{
+    SectionIcon, draw_led_vu_meter, retro_card, retro_checkbox, retro_pill,
+};
 use crate::ui::{BalsUiApp, UpdateUiState, open_in_shell};
 use crate::updater::{CURRENT_VERSION, ReleaseInfo};
 
-/// Pestaña 1 — Dashboard estilo Consola Retro OS (Opción A) en grilla modular 2×2.
+/// Pestaña 1 — Dashboard estilo Consola Retro OS en grilla modular 2×2.
 pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // Fila superior: VIDEO (izquierda) + MIXER DE AUDIO (derecha)
+            // Fila superior: VIDEO (izquierda) + AUDIO (derecha)
             ui.columns(2, |cols| {
                 cols[0].vertical(|ui| {
                     render_video_card(app, ui, p);
@@ -29,7 +30,7 @@ pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPale
 
             ui.add_space(8.0);
 
-            // Fila inferior: MODO & ATAJO GLOBAL (izquierda) + CARPETA, TEMA & SISTEMA (derecha)
+            // Fila inferior: CAPTURA Y ATAJO (izquierda) + SISTEMA Y TEMA (derecha)
             ui.columns(2, |cols| {
                 cols[0].vertical(|ui| {
                     render_capture_hotkey_card(app, ui, p);
@@ -39,6 +40,10 @@ pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPale
                 });
             });
         });
+
+    if app.show_exe_picker {
+        render_exe_picker_modal(app, ui.ctx(), p);
+    }
 }
 
 fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
@@ -52,7 +57,8 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
     retro_card(
         ui,
         p,
-        "VIDEO // ZERO-COPY GPU",
+        Some(SectionIcon::Video),
+        "VIDEO",
         Some(&hw_badge),
         |ui| {
             let row_w = ui.available_width();
@@ -72,6 +78,8 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     app.cfg.resolution = Resolution::P1440;
                 }
             });
+
+            ui.add_space(3.0);
 
             // FPS (2 píldoras) + Calidad QVBR (3 píldoras)
             ui.label(egui::RichText::new("FPS Y CALIDAD (QVBR)").size(10.0).color(p.crt_muted));
@@ -123,21 +131,24 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            // Encoder H.264 (AUTO / GPU HW / CPU SW)
+            ui.add_space(3.0);
+
+            // Encoder H.264 (GPU HW / CPU SW — preseleccionado automáticamente al iniciar)
             ui.label(egui::RichText::new("ENCODER H.264").size(10.0).color(p.crt_muted));
-            let w_enc_btn = ((row_w - sp * 2.0) / 3.0).max(70.0);
+            let w_enc_btn = ((row_w - sp) / 2.0).max(100.0);
 
             let gpu_pill_label = app
                 .detected_encoders
                 .hw_short
                 .as_deref()
-                .unwrap_or("GPU HW");
+                .map(|s| format!("GPU ({s})"))
+                .unwrap_or_else(|| "GPU (NO DISP.)".to_string());
             let hw_hover = app
                 .detected_encoders
                 .hw_name
                 .as_deref()
-                .map(|n| format!("Codificación H.264 por hardware en tu gráfica: {n}"))
-                .unwrap_or_else(|| "No se detectó encoder H.264 por hardware".to_string());
+                .map(|n| format!("Codificación H.264 por hardware en tu gráfica: {n} (con fallback seguro a CPU)"))
+                .unwrap_or_else(|| "No se detectó encoder H.264 por hardware en esta PC".to_string());
             let sw_hover = app
                 .detected_encoders
                 .sw_name
@@ -146,24 +157,12 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 .unwrap_or_else(|| "Codificación H.264 por CPU (Microsoft H.264 MFT)".to_string());
 
             ui.horizontal(|ui| {
-                if retro_pill(
-                    ui,
-                    p,
-                    app.cfg.encoder_pref == EncoderPreference::AutoGpu,
-                    "AUTO (GPU)",
-                    vec2(w_enc_btn, 22.0),
-                )
-                .on_hover_text("Usa tu gráfica automáticamente (fallback a CPU si falla)")
-                .clicked()
-                {
-                    app.cfg.encoder_pref = EncoderPreference::AutoGpu;
-                }
                 ui.add_enabled_ui(app.detected_encoders.hw_name.is_some(), |ui| {
                     if retro_pill(
                         ui,
                         p,
                         app.cfg.encoder_pref == EncoderPreference::HardwareGpu,
-                        gpu_pill_label,
+                        &gpu_pill_label,
                         vec2(w_enc_btn, 22.0),
                     )
                     .on_hover_text(&hw_hover)
@@ -186,6 +185,8 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
+            ui.add_space(3.0);
+
             // Duración del Replay Buffer (4 píldoras)
             ui.label(egui::RichText::new("REPLAY BUFFER EN RAM").size(10.0).color(p.crt_muted));
             let w4 = ((row_w - sp * 3.0) / 4.0).max(52.0);
@@ -202,7 +203,7 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            ui.add_space(4.0);
+            ui.add_space(5.0);
             let bitrate_bps = VideoConfig::recommended_bitrate_for(
                 app.cfg.resolution,
                 app.cfg.fps,
@@ -227,20 +228,22 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
     retro_card(
         ui,
         p,
-        "MIXER DE AUDIO // WASAPI",
+        Some(SectionIcon::Audio),
+        "AUDIO",
         Some("48kHz AAC"),
         |ui| {
             let row_w = ui.available_width();
-            let w2 = ((row_w - 7.0) / 2.0).max(95.0);
+            let sp = ui.spacing().item_spacing.x;
+            let w2 = ((row_w - sp) / 2.0).max(95.0);
 
-            ui.label(egui::RichText::new("FUENTE DE CAPTURA").size(10.5).color(p.crt_muted));
+            ui.label(egui::RichText::new("FUENTE DE CAPTURA").size(10.0).color(p.crt_muted));
             ui.horizontal(|ui| {
                 if retro_pill(
                     ui,
                     p,
                     app.cfg.audio_capture_mode == AudioCaptureMode::FullDesktop,
                     "ESCRITORIO",
-                    vec2(w2, 25.0),
+                    vec2(w2, 24.0),
                 )
                 .on_hover_text("Juego + Discord + música del sistema")
                 .clicked()
@@ -252,7 +255,7 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                     p,
                     app.cfg.audio_capture_mode == AudioCaptureMode::GameOnly,
                     "SOLO JUEGO",
-                    vec2(w2, 25.0),
+                    vec2(w2, 24.0),
                 )
                 .on_hover_text("Excluye Discord y música (ProcessLoopback)")
                 .clicked()
@@ -261,11 +264,14 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 }
             });
 
-            ui.add_space(6.0);
+            ui.add_space(7.0);
 
-            // Volumen Juego / Escritorio + VU LED segmentado
+            // Volumen Juego / Escritorio + VU LED segmentado (etiquetas alineadas a ancho fijo)
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("JUEGO / PC").size(11.5).color(p.crt_text));
+                ui.add_sized(
+                    vec2(78.0, 18.0),
+                    egui::Label::new(egui::RichText::new("JUEGO / PC").size(11.5).color(p.crt_text)),
+                );
                 let mut pct = (app.cfg.game_volume * 100.0).round();
                 if ui
                     .add(
@@ -293,7 +299,10 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
 
             ui.add_enabled_ui(app.cfg.mic_enabled, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("MICRÓFONO ").size(11.5).color(p.crt_text));
+                    ui.add_sized(
+                        vec2(78.0, 18.0),
+                        egui::Label::new(egui::RichText::new("MICRÓFONO").size(11.5).color(p.crt_text)),
+                    );
                     let mut pct = (app.cfg.mic_volume * 100.0).round();
                     if ui
                         .add(
@@ -322,7 +331,7 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
 
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Ajustar volúmenes al aplicar NO reinicia el Replay Buffer.")
+                egui::RichText::new("Ajustar volúmenes al guardar NO reinicia el Replay Buffer.")
                     .size(10.5)
                     .color(p.crt_muted),
             );
@@ -333,28 +342,30 @@ fn render_audio_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
 fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
     let mode_badge = match app.cfg.capture_mode {
         CaptureMode::AutoDetectGames => "0% GPU IDLE",
-        CaptureMode::ManualMonitor => "MONITOR AUTO",
+        CaptureMode::ManualMonitor => "MONITOR",
     };
 
     retro_card(
         ui,
         p,
-        "MODO & ATAJO GLOBAL",
+        Some(SectionIcon::Capture),
+        "CAPTURA Y ATAJO",
         Some(mode_badge),
         |ui| {
             let row_w = ui.available_width();
             let sp = ui.spacing().item_spacing.x;
             let w_mode = ((row_w - sp) / 2.0).max(110.0);
 
+            ui.label(egui::RichText::new("MODO DE CAPTURA").size(10.0).color(p.crt_muted));
             ui.horizontal(|ui| {
                 if retro_pill(
                     ui,
                     p,
                     app.cfg.capture_mode == CaptureMode::AutoDetectGames,
-                    "AUTO-JUEGOS",
-                    vec2(w_mode, 25.0),
+                    "JUEGOS",
+                    vec2(w_mode, 24.0),
                 )
-                .on_hover_text("Inicia automáticamente al abrir un juego y libera 100% GPU en escritorio")
+                .on_hover_text("Detecta juegos automáticamente y libera 100% GPU en el escritorio")
                 .clicked()
                 {
                     app.cfg.capture_mode = CaptureMode::AutoDetectGames;
@@ -363,10 +374,10 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                     ui,
                     p,
                     app.cfg.capture_mode == CaptureMode::ManualMonitor,
-                    "MONITOR (PANTALLA)",
-                    vec2(w_mode, 25.0),
+                    "MONITOR",
+                    vec2(w_mode, 24.0),
                 )
-                .on_hover_text("Graba automáticamente toda la pantalla seleccionada en lugar de detectar juegos")
+                .on_hover_text("Graba continuamente toda la pantalla seleccionada")
                 .clicked()
                 {
                     app.cfg.capture_mode = CaptureMode::ManualMonitor;
@@ -376,73 +387,123 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                 }
             });
 
-            if app.cfg.capture_mode == CaptureMode::ManualMonitor {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("PANTALLA A GRABAR (INICIO AUTOMÁTICO)")
-                            .size(10.0)
-                            .color(p.crt_muted),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if retro_pill(ui, p, false, "ACT", vec2(38.0, 18.0))
-                            .on_hover_text("Volver a detectar monitores conectados")
-                            .clicked()
-                        {
-                            app.refresh_monitors();
-                        }
+            ui.add_space(5.0);
+
+            // Sección contextual según el modo elegido (Juegos en ventana vs Selección de Monitor)
+            match app.cfg.capture_mode {
+                CaptureMode::AutoDetectGames => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("JUEGOS EN VENTANA (.EXE)")
+                                .size(10.0)
+                                .color(p.crt_muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if retro_pill(ui, p, false, "+ AGREGAR .EXE", vec2(114.0, 20.0))
+                                .on_hover_text("Detecta programas activos para agregarlos sin escribir el nombre")
+                                .clicked()
+                            {
+                                app.open_exe_picker();
+                            }
+                        });
                     });
-                });
 
-                if app.monitors.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Usando monitor principal del sistema.")
-                            .size(11.0)
+                    if app.cfg.extra_game_exes.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "Pantalla completa es automática. Agrega un .exe si juegas en ventana.",
+                            )
+                            .size(10.5)
                             .color(p.crt_muted),
-                    );
-                } else {
-                    let selected_dev = app.cfg.selected_monitor.as_deref();
-                    let per_row = app.monitors.len().clamp(1, 2);
-                    let pill_w = ((row_w - sp * (per_row as f32 - 1.0)) / per_row as f32).max(120.0);
-                    let mut chosen_dev: Option<String> = None;
-
-                    for chunk in app.monitors.chunks(2) {
-                        ui.horizontal(|ui| {
-                            for m in chunk {
-                                let is_sel = match selected_dev {
-                                    Some(dev) => m.device_name.eq_ignore_ascii_case(dev),
-                                    None => m.is_primary || m.index == 1,
-                                };
-                                let hover = if m.is_primary {
-                                    format!("Monitor principal ({})", m.device_name)
-                                } else {
-                                    format!("Monitor secundario ({})", m.device_name)
-                                };
-                                if retro_pill(ui, p, is_sel, &m.ui_label(), vec2(pill_w, 22.0))
-                                    .on_hover_text(hover)
+                        );
+                    } else {
+                        let mut remove_idx: Option<usize> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(5.0, 4.0);
+                            for (idx, exe) in app.cfg.extra_game_exes.iter().enumerate() {
+                                let label = format!("{exe}  ×");
+                                let chip_w = (label.chars().count() as f32 * 6.8 + 16.0).max(70.0);
+                                if retro_pill(ui, p, false, &label, vec2(chip_w, 21.0))
+                                    .on_hover_text("Clic para quitar de la lista")
                                     .clicked()
                                 {
-                                    chosen_dev = Some(m.device_name.clone());
+                                    remove_idx = Some(idx);
                                 }
                             }
                         });
+                        if let Some(idx) = remove_idx {
+                            app.cfg.extra_game_exes.remove(idx);
+                        }
                     }
+                }
+                CaptureMode::ManualMonitor => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("PANTALLA A GRABAR")
+                                .size(10.0)
+                                .color(p.crt_muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if retro_pill(ui, p, false, "ACT", vec2(38.0, 18.0))
+                                .on_hover_text("Volver a detectar monitores conectados")
+                                .clicked()
+                            {
+                                app.refresh_monitors();
+                            }
+                        });
+                    });
 
-                    if let Some(dev) = chosen_dev {
-                        app.cfg.selected_monitor = Some(dev);
+                    if app.monitors.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Usando monitor principal del sistema.")
+                                .size(11.0)
+                                .color(p.crt_muted),
+                        );
+                    } else {
+                        let selected_dev = app.cfg.selected_monitor.as_deref();
+                        let per_row = app.monitors.len().clamp(1, 2);
+                        let pill_w =
+                            ((row_w - sp * (per_row as f32 - 1.0)) / per_row as f32).max(120.0);
+                        let mut chosen_dev: Option<String> = None;
+
+                        for chunk in app.monitors.chunks(2) {
+                            ui.horizontal(|ui| {
+                                for m in chunk {
+                                    let is_sel = match selected_dev {
+                                        Some(dev) => m.device_name.eq_ignore_ascii_case(dev),
+                                        None => m.is_primary || m.index == 1,
+                                    };
+                                    let hover = if m.is_primary {
+                                        format!("Monitor principal ({})", m.device_name)
+                                    } else {
+                                        format!("Monitor secundario ({})", m.device_name)
+                                    };
+                                    if retro_pill(ui, p, is_sel, &m.ui_label(), vec2(pill_w, 22.0))
+                                        .on_hover_text(hover)
+                                        .clicked()
+                                    {
+                                        chosen_dev = Some(m.device_name.clone());
+                                    }
+                                }
+                            });
+                        }
+
+                        if let Some(dev) = chosen_dev {
+                            app.cfg.selected_monitor = Some(dev);
+                        }
                     }
                 }
             }
 
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("TECLA PARA GUARDAR CLIP").size(10.5).color(p.crt_muted));
+            ui.label(egui::RichText::new("TECLA PARA GUARDAR CLIP").size(10.0).color(p.crt_muted));
 
-            // Keycap estilizada + botón interactivo "ASIGNAR TECLA" + edición manual
+            // Keycap limpia (sin corchetes `[ ]`) + botón único ASIGNAR TECLA
             ui.horizontal(|ui| {
                 let key_display = if app.listening_hotkey {
-                    "...".to_string()
+                    "..."
                 } else {
-                    format!("[ {} ]", app.cfg.save_clip_hotkey)
+                    app.cfg.save_clip_hotkey.as_str()
                 };
                 let (krect, _) = ui.allocate_exact_size(vec2(96.0, 28.0), Sense::hover());
                 let painter = ui.painter();
@@ -455,10 +516,14 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                 painter.rect_stroke(krect, 3.0, Stroke::new(1.5, kborder), StrokeKind::Inside);
                 painter.text(
                     krect.center(),
-                    egui::Align2::CENTER_CENTER,
+                    Align2::CENTER_CENTER,
                     key_display,
-                    egui::FontId::monospace(13.0),
-                    if app.listening_hotkey { p.amber } else { p.accent_bright },
+                    FontId::monospace(13.0),
+                    if app.listening_hotkey {
+                        p.amber
+                    } else {
+                        p.accent_bright
+                    },
                 );
 
                 let bind_lbl = if app.listening_hotkey {
@@ -466,22 +531,9 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                 } else {
                     "ASIGNAR TECLA"
                 };
-                let btn_w = (ui.available_width() - 74.0 - sp - 6.0).max(115.0);
+                let btn_w = ui.available_width().max(130.0);
                 if retro_pill(ui, p, app.listening_hotkey, bind_lbl, vec2(btn_w, 28.0)).clicked() {
-                    app.listening_hotkey = !app.listening_hotkey;
-                }
-
-                // Entrada directa compacta por si prefiere escribir `Alt+F10`
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut app.cfg.save_clip_hotkey)
-                        .desired_width(74.0)
-                        .hint_text("\\ / F8"),
-                );
-                if resp.changed() {
-                    app.listening_hotkey = false;
-                    app.hotkey_error = parse_hotkey(&app.cfg.save_clip_hotkey)
-                        .err()
-                        .map(|e| format!("{e}"));
+                    app.set_listening_hotkey(!app.listening_hotkey);
                 }
             });
 
@@ -511,14 +563,15 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
     retro_card(
         ui,
         p,
-        "CARPETA, TEMA & SISTEMA",
+        Some(SectionIcon::System),
+        "SISTEMA Y TEMA",
         Some(&format!("v{CURRENT_VERSION}")),
         |ui| {
             let sp = ui.spacing().item_spacing.x;
 
             // Carpeta de clips
+            ui.label(egui::RichText::new("CARPETA DE CLIPS").size(10.0).color(p.crt_muted));
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("CLIPS:").size(11.0).color(p.crt_muted));
                 let mut dir_str = app.cfg.clips_dir.to_string_lossy().into_owned();
                 let input_w = (ui.available_width() - 66.0 - sp - 6.0).max(120.0);
                 if ui
@@ -533,25 +586,14 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                 }
             });
 
-            // Juegos extra en modo ventana
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("EXES: ").size(11.0).color(p.crt_muted));
-                let input_w = (ui.available_width() - 6.0).max(120.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.extra_games_text)
-                        .hint_text("ej: javaw.exe, valorant.exe")
-                        .desired_width(input_w),
-                );
-            });
-
-            ui.add_space(4.0);
+            ui.add_space(6.0);
 
             // Selector de Tema Retro + toggle Scanlines CRT
+            ui.label(egui::RichText::new("APARIENCIA").size(10.0).color(p.crt_muted));
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("TEMA:").size(10.5).color(p.crt_muted));
                 let crt_w = 56.0;
                 let avail = (ui.available_width() - crt_w - sp * 4.0).max(160.0);
-                let tw = (avail / 4.0).max(40.0);
+                let tw = (avail / 4.0).max(42.0);
                 for theme in UiTheme::ALL {
                     if retro_pill(
                         ui,
@@ -568,13 +610,13 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                 retro_checkbox(ui, p, &mut app.cfg.crt_scanlines, "CRT");
             });
 
-            ui.add_space(6.0);
+            ui.add_space(10.0);
 
-            // Botón principal [ GUARDAR Y APLICAR ] + Auto-updater
+            // Botón principal GUARDAR (sin corchetes) + Auto-updater
             let avail_w = ui.available_width();
             ui.horizontal(|ui| {
                 let save_w = ((avail_w - sp) * 0.62).max(165.0);
-                if retro_pill(ui, p, true, "[ GUARDAR Y APLICAR ]", vec2(save_w, 30.0))
+                if retro_pill(ui, p, true, "GUARDAR", vec2(save_w, 30.0))
                     .on_hover_text("Guarda config.toml y aplica al instante (Ctrl+S)")
                     .clicked()
                 {
@@ -647,4 +689,187 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
             }
         },
     );
+}
+
+/// Ventana modal estilo vibranceGUI para elegir procesos `.exe` activos en el escritorio.
+fn render_exe_picker_modal(app: &mut BalsUiApp, ctx: &egui::Context, p: &RetroPalette) {
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.show_exe_picker = false;
+        return;
+    }
+
+    let modal_frame = egui::Frame::new()
+        .fill(p.crt_panel_bg)
+        .stroke(Stroke::new(2.0, p.accent))
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(egui::Margin::same(14));
+
+    let mut keep_open = app.show_exe_picker;
+    let mut clicked_exe: Option<String> = None;
+
+    egui::Window::new("SELECCIONAR PROGRAMA ACTIVO (.EXE)")
+        .open(&mut keep_open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .fixed_size(vec2(490.0, 360.0))
+        .frame(modal_frame)
+        .show(ctx, |ui| {
+            let sp = ui.spacing().item_spacing.x;
+
+            // Barra superior: filtro + botón actualizar
+            ui.horizontal(|ui| {
+                let filter_w = (ui.available_width() - 96.0 - sp).max(160.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.exe_picker_filter)
+                        .hint_text("Filtrar por .exe o título de ventana...")
+                        .desired_width(filter_w),
+                );
+                if retro_pill(ui, p, false, "ACTUALIZAR", vec2(96.0, 24.0))
+                    .on_hover_text("Volver a escanear las ventanas abiertas")
+                    .clicked()
+                {
+                    app.refresh_running_apps();
+                }
+            });
+
+            ui.add_space(6.0);
+
+            let needle = app.exe_picker_filter.trim().to_ascii_lowercase();
+            let filtered: Vec<_> = app
+                .running_apps
+                .iter()
+                .filter(|item| {
+                    needle.is_empty()
+                        || item.exe_name.to_ascii_lowercase().contains(&needle)
+                        || item.window_title.to_ascii_lowercase().contains(&needle)
+                })
+                .cloned()
+                .collect();
+
+            if filtered.is_empty() {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "No se detectaron programas abiertos con ese filtro.\nAbre tu juego y pulsa ACTUALIZAR.",
+                        )
+                        .size(11.5)
+                        .color(p.crt_muted),
+                    );
+                });
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(248.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for item in &filtered {
+                            let is_added = app
+                                .cfg
+                                .extra_game_exes
+                                .iter()
+                                .any(|g| g.eq_ignore_ascii_case(&item.exe_name));
+
+                            let row_h = 34.0;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), row_h),
+                                Sense::click(),
+                            );
+                            let painter = ui.painter();
+
+                            let bg = if is_added {
+                                Color32::from_rgba_unmultiplied(
+                                    p.accent.r(),
+                                    p.accent.g(),
+                                    p.accent.b(),
+                                    32,
+                                )
+                            } else if resp.hovered() {
+                                p.crt_widget_hover
+                            } else {
+                                p.crt_recess
+                            };
+                            let border = if is_added || resp.hovered() {
+                                p.accent
+                            } else {
+                                p.crt_widget_hover
+                            };
+
+                            painter.rect_filled(rect, 3.0, bg);
+                            painter.rect_stroke(
+                                rect,
+                                3.0,
+                                Stroke::new(1.1, border),
+                                StrokeKind::Inside,
+                            );
+
+                            // Nombre del ejecutable (arriba) + título de ventana (abajo)
+                            painter.text(
+                                pos2(rect.left() + 9.0, rect.top() + 11.0),
+                                Align2::LEFT_CENTER,
+                                &item.exe_name,
+                                FontId::monospace(12.0),
+                                if is_added { p.accent_bright } else { p.crt_text },
+                            );
+
+                            let title_short = truncate_chars(&item.window_title, 46);
+                            painter.text(
+                                pos2(rect.left() + 9.0, rect.bottom() - 9.5),
+                                Align2::LEFT_CENTER,
+                                title_short,
+                                FontId::monospace(10.0),
+                                p.crt_muted,
+                            );
+
+                            // Insignia derecha: AGREGADO / + AGREGAR
+                            let badge_txt = if is_added { "AGREGADO ×" } else { "+ AGREGAR" };
+                            let badge_col = if is_added { p.accent_bright } else { p.amber };
+                            painter.text(
+                                pos2(rect.right() - 10.0, rect.center().y),
+                                Align2::RIGHT_CENTER,
+                                badge_txt,
+                                FontId::monospace(10.5),
+                                badge_col,
+                            );
+
+                            if resp.clicked() {
+                                clicked_exe = Some(item.exe_name.clone());
+                            }
+                            ui.add_space(3.0);
+                        }
+                    });
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Clic para agregar/quitar. Recuerda pulsar GUARDAR.")
+                        .size(10.2)
+                        .color(p.crt_muted),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if retro_pill(ui, p, true, "LISTO", vec2(74.0, 24.0)).clicked() {
+                        app.show_exe_picker = false;
+                    }
+                });
+            });
+        });
+
+    if let Some(exe) = clicked_exe {
+        app.toggle_extra_exe(&exe);
+    }
+    if !keep_open {
+        app.show_exe_picker = false;
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        text.to_string()
+    } else {
+        let mut s: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    }
 }

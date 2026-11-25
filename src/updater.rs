@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -50,15 +50,29 @@ impl Drop for WinHttpHandle {
     }
 }
 
-/// Elimina el binario `.old` que haya quedado de una actualización anterior.
+/// Elimina binarios temporales (`.old`, `.old2`, `.new`) que hayan quedado de una actualización anterior.
 pub fn cleanup_old_binary() {
     if let Ok(exe) = std::env::current_exe() {
-        let old = exe.with_extension("exe.old");
-        if old.exists() {
-            match std::fs::remove_file(&old) {
-                Ok(()) => debug!(path = %old.display(), "Binario anterior (.old) eliminado"),
-                Err(err) => debug!("No se pudo eliminar {}: {err}", old.display()),
+        let mut leftovers = Vec::new();
+        for ext in ["exe.old", "exe.old2", "exe.old3", "exe.new"] {
+            let p = exe.with_extension(ext);
+            if p.exists() {
+                if let Err(err) = std::fs::remove_file(&p) {
+                    debug!("Archivo {} aún ocupado ({err}); reintentando en breve", p.display());
+                    leftovers.push(p);
+                } else {
+                    debug!(path = %p.display(), "Binario temporal eliminado");
+                }
             }
+        }
+        // Si el proceso anterior todavía estaba terminando al arrancar, reintentar tras 1.5 s.
+        if !leftovers.is_empty() {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                for p in leftovers {
+                    let _ = std::fs::remove_file(&p);
+                }
+            });
         }
     }
 }
@@ -133,21 +147,22 @@ pub fn download_update_bytes(info: &ReleaseInfo) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Reemplaza el binario en ejecución (renombrando el actual a `.old`) con `bytes` ya descargados
-/// y relanza la nueva versión.
-pub fn apply_downloaded_update(
-    bytes: &[u8],
-    info: &ReleaseInfo,
-    launch_args: &[&str],
-) -> Result<()> {
+/// Reemplaza el binario en disco (renombrando el actual a `.old`) sin relanzar aún el proceso.
+/// Devuelve la ruta final del ejecutable (`bals.exe`) lista para relanzarse tras cerrar el daemon.
+pub fn replace_current_exe(bytes: &[u8]) -> Result<PathBuf> {
     let current_exe = std::env::current_exe().context("No se pudo resolver current_exe")?;
     let new_exe = current_exe.with_extension("exe.new");
-    let old_exe = current_exe.with_extension("exe.old");
 
     write_file_atomic(&new_exe, bytes)?;
 
+    // Elegir un nombre `.old` libre por si un proceso previo aún bloqueaba `bals.exe.old`.
+    let old_exe = ["exe.old", "exe.old2", "exe.old3"]
+        .into_iter()
+        .map(|ext| current_exe.with_extension(ext))
+        .find(|p| !p.exists() || std::fs::remove_file(p).is_ok())
+        .unwrap_or_else(|| current_exe.with_extension("exe.old"));
+
     // Windows permite renombrar un .exe mientras está en ejecución.
-    let _ = std::fs::remove_file(&old_exe);
     std::fs::rename(&current_exe, &old_exe)
         .context("No se pudo renombrar el bals.exe actual a .old")?;
 
@@ -157,24 +172,38 @@ pub fn apply_downloaded_update(
         return Err(err).context("No se pudo mover la nueva versión a bals.exe");
     }
 
+    Ok(current_exe)
+}
+
+/// Relanza el ejecutable actualizado con los argumentos indicados.
+pub fn spawn_updated_exe(exe_path: &Path, launch_args: &[&str]) -> Result<()> {
+    Command::new(exe_path)
+        .args(launch_args)
+        .spawn()
+        .with_context(|| format!("No se pudo relanzar {}", exe_path.display()))?;
+    Ok(())
+}
+
+/// Reemplaza el binario en ejecución (renombrando el actual a `.old`) con `bytes` ya descargados
+/// y relanza la nueva versión.
+pub fn apply_downloaded_update(
+    bytes: &[u8],
+    info: &ReleaseInfo,
+    launch_args: &[&str],
+) -> Result<()> {
+    let current_exe = replace_current_exe(bytes)?;
+
     info!(
         version = %info.version,
         path = %current_exe.display(),
         "Actualización aplicada; reiniciando Bals..."
     );
 
-    if let Err(err) = Command::new(&current_exe).args(launch_args).spawn() {
-        warn!("Actualizado correctamente, pero falló el reinicio automático: {err}");
+    if let Err(err) = spawn_updated_exe(&current_exe, launch_args) {
+        warn!("Actualizado correctamente, pero falló el reinicio automático: {err:#}");
     }
 
     Ok(())
-}
-
-/// Descarga el nuevo `bals.exe`, verifica su cabecera PE (`MZ`), reemplaza el binario en ejecución
-/// y relanza la nueva versión.
-pub fn download_and_apply_update(info: &ReleaseInfo, launch_args: &[&str]) -> Result<()> {
-    let bytes = download_update_bytes(info)?;
-    apply_downloaded_update(&bytes, info, launch_args)
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -391,11 +420,13 @@ fn https_get_bytes_once(
         "WinHttpOpenRequest",
     )?;
 
-    // Cabeceras estándar recomendadas por GitHub REST API.
-    let headers: Vec<u16> = "Accept: application/vnd.github+json\r\n"
-        .encode_utf16()
-        .collect();
-    unsafe { WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0) }
+    // Enviar cabecera JSON únicamente a GitHub REST API (no al descargar binarios desde CDN).
+    let api_headers: Option<Vec<u16>> = if host.eq_ignore_ascii_case("api.github.com") {
+        Some("Accept: application/vnd.github+json\r\n".encode_utf16().collect())
+    } else {
+        None
+    };
+    unsafe { WinHttpSendRequest(request.0, api_headers.as_deref(), None, 0, 0, 0) }
         .context("WinHttpSendRequest falló")?;
 
     unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }

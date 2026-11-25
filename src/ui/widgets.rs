@@ -76,10 +76,147 @@ pub fn draw_crt_recess(painter: &egui::Painter, rect: Rect, p: &RetroPalette) {
     );
 }
 
+/// Íconos vectoriales retro 14×14 para identificar visualmente cada tarjeta de sección.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionIcon {
+    Video,
+    Audio,
+    Capture,
+    System,
+    Clips,
+    Deck,
+}
+
+/// Dibuja un ícono vectorial retro nítido de 14×14 px acorde a la paleta CRT activa.
+pub fn draw_section_icon(painter: &egui::Painter, rect: Rect, p: &RetroPalette, icon: SectionIcon) {
+    let col = p.accent_bright;
+    let stroke = Stroke::new(1.3, col);
+    let r = rect.shrink(1.0);
+
+    match icon {
+        SectionIcon::Video => {
+            // Cámara de video retro: cuerpo + lente triangular a la derecha + LED REC
+            let body = Rect::from_min_max(
+                pos2(r.left(), r.top() + 2.0),
+                pos2(r.left() + r.width() * 0.66, r.bottom() - 2.0),
+            );
+            painter.rect_stroke(body, 1.5, stroke, StrokeKind::Inside);
+            painter.circle_filled(
+                pos2(body.left() + 3.0, body.top() + 3.0),
+                1.3,
+                p.led_red,
+            );
+            let lens_x = body.right() + 0.5;
+            let lens = vec![
+                pos2(lens_x, r.center().y - 1.5),
+                pos2(r.right(), r.top() + 2.5),
+                pos2(r.right(), r.bottom() - 2.5),
+                pos2(lens_x, r.center().y + 1.5),
+            ];
+            painter.add(egui::Shape::convex_polygon(lens, col, Stroke::NONE));
+        }
+        SectionIcon::Audio => {
+            // Parlante + dos barras/ondas sonoras
+            let box_r = Rect::from_min_max(
+                pos2(r.left(), r.center().y - 2.5),
+                pos2(r.left() + 3.2, r.center().y + 2.5),
+            );
+            painter.rect_filled(box_r, 0.5, col);
+            let cone = vec![
+                pos2(box_r.right() - 0.5, r.center().y - 2.5),
+                pos2(r.left() + 7.2, r.top() + 1.5),
+                pos2(r.left() + 7.2, r.bottom() - 1.5),
+                pos2(box_r.right() - 0.5, r.center().y + 2.5),
+            ];
+            painter.add(egui::Shape::convex_polygon(cone, col, Stroke::NONE));
+            painter.line_segment(
+                [
+                    pos2(r.left() + 9.5, r.center().y - 2.6),
+                    pos2(r.left() + 9.5, r.center().y + 2.6),
+                ],
+                Stroke::new(1.3, p.amber),
+            );
+            painter.line_segment(
+                [
+                    pos2(r.left() + 11.8, r.center().y - 4.4),
+                    pos2(r.left() + 11.8, r.center().y + 4.4),
+                ],
+                Stroke::new(1.3, col),
+            );
+        }
+        SectionIcon::Capture => {
+            // Monitor con mira / captura central + base
+            let screen = Rect::from_min_max(
+                pos2(r.left(), r.top() + 1.0),
+                pos2(r.right(), r.bottom() - 3.5),
+            );
+            painter.rect_stroke(screen, 1.5, stroke, StrokeKind::Inside);
+            // Pequeño punto de captura en el centro de la pantalla
+            painter.circle_filled(screen.center(), 1.8, p.amber);
+            // Pie del monitor
+            painter.line_segment(
+                [
+                    pos2(r.center().x, screen.bottom()),
+                    pos2(r.center().x, r.bottom() - 1.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    pos2(r.center().x - 3.5, r.bottom() - 0.8),
+                    pos2(r.center().x + 3.5, r.bottom() - 0.8),
+                ],
+                stroke,
+            );
+        }
+        SectionIcon::System => {
+            // Sliders / panel de ajustes retro (3 carriles con perillas)
+            let ys = [r.top() + 2.5, r.center().y, r.bottom() - 2.5];
+            let knobs = [r.left() + 3.5, r.right() - 3.5, r.center().x];
+            for (y, kx) in ys.into_iter().zip(knobs) {
+                painter.line_segment(
+                    [pos2(r.left() + 0.5, y), pos2(r.right() - 0.5, y)],
+                    Stroke::new(1.2, p.crt_muted),
+                );
+                painter.rect_filled(
+                    Rect::from_center_size(pos2(kx, y), vec2(3.2, 3.2)),
+                    0.5,
+                    col,
+                );
+            }
+        }
+        SectionIcon::Clips => {
+            // Mini disquete 3.5"
+            painter.rect_stroke(r, 1.5, stroke, StrokeKind::Inside);
+            let shutter = Rect::from_min_max(
+                pos2(r.left() + 3.0, r.top() + 1.0),
+                pos2(r.right() - 3.0, r.top() + 5.0),
+            );
+            painter.rect_filled(shutter, 0.5, col);
+            let lbl = Rect::from_min_max(
+                pos2(r.left() + 2.5, r.bottom() - 5.0),
+                pos2(r.right() - 2.5, r.bottom() - 1.5),
+            );
+            painter.rect_filled(lbl, 0.5, p.amber);
+        }
+        SectionIcon::Deck => {
+            // Mini reproductor / deck (triángulo Play dentro de pantalla)
+            painter.rect_stroke(r, 1.8, stroke, StrokeKind::Inside);
+            let play = vec![
+                pos2(r.center().x - 2.0, r.center().y - 3.0),
+                pos2(r.center().x + 3.0, r.center().y),
+                pos2(r.center().x - 2.0, r.center().y + 3.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(play, p.amber, Stroke::NONE));
+        }
+    }
+}
+
 /// Tarjeta modular estilo Consola Retro OS (Opción A) dentro de la pantalla CRT.
 pub fn retro_card(
     ui: &mut egui::Ui,
     p: &RetroPalette,
+    icon: Option<SectionIcon>,
     title: &str,
     right_badge: Option<&str>,
     add_contents: impl FnOnce(&mut egui::Ui),
@@ -93,6 +230,10 @@ pub fn retro_card(
     frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
+            if let Some(ic) = icon {
+                let (irect, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                draw_section_icon(ui.painter(), irect, p, ic);
+            }
             ui.label(
                 egui::RichText::new(title)
                     .strong()

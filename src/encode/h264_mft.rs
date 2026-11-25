@@ -171,11 +171,10 @@ impl H264Encoder {
         }
     }
 
-    /// Intenta activar el backend H.264 elegido (GPU hardware y/o fallback a CPU software).
+    /// Intenta activar el backend H.264 elegido (GPU hardware con fallback seguro a CPU, o solo CPU).
     fn init_with_fallbacks(d3d: &SharedD3DDevice, config: VideoConfig) -> Result<Self> {
         let attempts: &[bool] = match config.encoder_pref {
-            EncoderPreference::HardwareGpu => &[true],
-            EncoderPreference::AutoGpu => &[true, false],
+            EncoderPreference::HardwareGpu => &[true, false],
             EncoderPreference::SoftwareCpu => &[false],
         };
 

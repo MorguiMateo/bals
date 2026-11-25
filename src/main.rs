@@ -20,6 +20,7 @@ mod ui;
 mod updater;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -69,9 +70,10 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // Instancia única: si el motor ya está en la bandeja, solo abrir o enfocar la ventana UI.
+    // Instancia única: si el motor ya está en la bandeja, abrir/enfocar la UI y pedir chequeo de update.
     if ipc::is_daemon_running() {
         ipc::spawn_or_focus_ui();
+        ipc::notify_check_update();
         return Ok(());
     }
 
@@ -83,25 +85,78 @@ fn run_daemon(open_ui_on_start: bool) -> Result<()> {
     let cfg = AppConfig::load_or_create();
     let engine = RecorderEngine::spawn(cfg.clone())?;
 
-    if cfg.auto_update {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(6));
-            match updater::check_latest_release() {
-                Ok(Some(info)) => {
-                    info!(version = %info.version, "Nueva versión detectada; actualizando en segundo plano");
-                    if let Err(err) = updater::download_and_apply_update(&info, &["--tray"]) {
-                        warn!("No se pudo aplicar la actualización automática: {err:#}");
-                    } else {
+    let (upd_tx, upd_rx) = crossbeam_channel::bounded::<()>(1);
+    let pending_restart: Arc<Mutex<Option<(PathBuf, bool)>>> = Arc::new(Mutex::new(None));
+    let pending_restart_bg = Arc::clone(&pending_restart);
+
+    std::thread::Builder::new()
+        .name("bals-auto-updater".to_string())
+        .spawn(move || {
+            let try_auto_update = |pending: &Arc<Mutex<Option<(PathBuf, bool)>>>| -> Result<bool, anyhow::Error> {
+                if !AppConfig::load_or_create().auto_update {
+                    return Ok(false);
+                }
+                match updater::check_latest_release()? {
+                    Some(info) => {
+                        info!(
+                            version = %info.version,
+                            "Nueva versión detectada; descargando actualización en segundo plano..."
+                        );
+                        let bytes = updater::download_update_bytes(&info)?;
+                        let exe_path = updater::replace_current_exe(&bytes)?;
+                        let reopen_ui = ipc::is_ui_open();
+                        if let Ok(mut slot) = pending.lock() {
+                            *slot = Some((exe_path, reopen_ui));
+                        }
+                        info!(
+                            version = %info.version,
+                            reopen_ui,
+                            "Actualización preparada; cerrando daemon actual para reiniciar limpiamente"
+                        );
+                        ipc::close_ui_window();
                         ipc::notify_shutdown();
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            };
+
+            // 1. Chequeo rápido al iniciar (con reintento a los 30s si el PC recién encendió sin red).
+            std::thread::sleep(Duration::from_secs(2));
+            let mut last_check = Instant::now();
+            match try_auto_update(&pending_restart_bg) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::debug!("Comprobación inicial de actualización falló ({err:#}); reintentando en 30s");
+                    match upd_rx.recv_timeout(Duration::from_secs(30)) {
+                        Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            last_check = Instant::now();
+                            if matches!(try_auto_update(&pending_restart_bg), Ok(true)) {
+                                return;
+                            }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::debug!("Comprobación de actualización omitida: {err:#}");
+            }
+
+            // 2. Chequeos bajo demanda cada vez que el usuario abre Bals (cooldown de 30s).
+            while upd_rx.recv().is_ok() {
+                if last_check.elapsed() < Duration::from_secs(30) {
+                    continue;
+                }
+                last_check = Instant::now();
+                match try_auto_update(&pending_restart_bg) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!("No se pudo completar la actualización automática: {err:#}");
+                    }
                 }
             }
-        });
-    }
+        })
+        .ok();
 
     if open_ui_on_start {
         // Abrir la ventana UI tras un breve respiro para que la ventana de bandeja ya esté creada.
@@ -116,9 +171,21 @@ fn run_daemon(open_ui_on_start: bool) -> Result<()> {
         engine.cmd_tx.clone(),
         engine.event_rx.clone(),
         engine.status.clone(),
+        upd_tx,
     );
 
+    // Cerrar motor, GPU, audio y hotkey ANTES de lanzar el nuevo ejecutable (cero condiciones de carrera).
     engine.shutdown();
+
+    if let Ok(mut slot) = pending_restart.lock() {
+        if let Some((exe_path, reopen_ui)) = slot.take() {
+            let launch_args: &[&str] = if reopen_ui { &[] } else { &["--tray"] };
+            if let Err(err) = updater::spawn_updated_exe(&exe_path, launch_args) {
+                warn!("Actualizado correctamente, pero falló el reinicio automático: {err:#}");
+            }
+        }
+    }
+
     tray_res
 }
 
@@ -145,7 +212,7 @@ fn run_cli_test(test_args: &[String]) -> Result<()> {
         resolution,
         fps,
         QualityPreset::Balanced,
-        EncoderPreference::AutoGpu,
+        EncoderPreference::HardwareGpu,
     );
     let audio_config = AudioConfig {
         source: match pid_opt {

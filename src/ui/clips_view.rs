@@ -4,7 +4,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKin
 
 use crate::ui::theme::RetroPalette;
 use crate::ui::widgets::{
-    draw_dual_trim_timeline, draw_floppy_icon, draw_scanlines, retro_card, retro_pill,
+    SectionIcon, draw_dual_trim_timeline, draw_floppy_icon, draw_scanlines, retro_card, retro_pill,
 };
 use crate::ui::{BalsUiApp, open_in_shell};
 
@@ -45,7 +45,13 @@ pub fn render_clips_tab(
 
 fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
     let badge = format!("{} MP4", app.clips.len());
-    retro_card(ui, p, "ARCHIVO DE CLIPS", Some(&badge), |ui| {
+    retro_card(
+        ui,
+        p,
+        Some(SectionIcon::Clips),
+        "ARCHIVO DE CLIPS",
+        Some(&badge),
+        |ui| {
         // Controles rápidos: filtro + actualizar + abrir carpeta
         ui.horizontal(|ui| {
             let filter_w = (ui.available_width() - 106.0).max(80.0);
@@ -202,6 +208,7 @@ fn render_crt_deck(
     retro_card(
         ui,
         p,
+        Some(SectionIcon::Deck),
         "MONITOR CRT & RECORTADOR",
         meta_badge.as_deref(),
         |ui| {

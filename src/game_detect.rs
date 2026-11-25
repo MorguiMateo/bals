@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use windows::Win32::Foundation::{CloseHandle, HWND, RECT, STILL_ACTIVE};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, STILL_ACTIVE};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
@@ -9,9 +10,10 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible,
 };
-use windows::core::PWSTR;
+use windows::core::{BOOL, PWSTR};
 
 /// Procesos comunes de escritorio, navegadores o herramientas que NO deben activar
 /// la grabación automática aunque se pongan en pantalla completa.
@@ -182,4 +184,90 @@ fn is_fullscreen_window(hwnd: HWND) -> bool {
 
     // Cubre >= 98% del ancho y alto del monitor (pantalla completa exclusiva o borderless).
     (win_w * 100 >= mon_w * 98) && (win_h * 100 >= mon_h * 98)
+}
+
+/// Procesos internos del shell de Windows (y el propio Bals) que se ocultan del selector de `.exe`.
+const PICKER_SHELL_EXES: &[&str] = &[
+    "bals.exe",
+    "explorer.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "textinputhost.exe",
+    "applicationframehost.exe",
+    "lockapp.exe",
+    "dwm.exe",
+    "systemsettings.exe",
+    "taskmgr.exe",
+    "nvidia overlay.exe",
+    "nvcontainer.exe",
+];
+
+/// Aplicación activa con ventana visible detectada en el sistema (para selector estilo vibranceGUI).
+#[derive(Debug, Clone)]
+pub struct RunningApp {
+    pub exe_name: String,
+    pub window_title: String,
+}
+
+/// Enumera las aplicaciones activas con ventanas visibles en el escritorio, deduplicadas por `.exe`.
+pub fn list_running_window_apps() -> Vec<RunningApp> {
+    let mut found: BTreeMap<String, RunningApp> = BTreeMap::new();
+    let ptr = &mut found as *mut BTreeMap<String, RunningApp> as isize;
+    unsafe {
+        let _ = EnumWindows(Some(enum_visible_windows_proc), LPARAM(ptr));
+    }
+    found.into_values().collect()
+}
+
+unsafe extern "system" fn enum_visible_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let title_len = GetWindowTextLengthW(hwnd);
+        if title_len <= 0 {
+            return BOOL(1);
+        }
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return BOOL(1);
+        }
+
+        let Some(exe_name) = process_exe_name(pid) else {
+            return BOOL(1);
+        };
+        let exe_lower = exe_name.to_ascii_lowercase();
+        if PICKER_SHELL_EXES.iter().any(|&sh| sh == exe_lower) {
+            return BOOL(1);
+        }
+
+        let mut buf = vec![0u16; (title_len as usize) + 1];
+        let copied = GetWindowTextW(hwnd, &mut buf);
+        if copied <= 0 {
+            return BOOL(1);
+        }
+        let title = String::from_utf16_lossy(&buf[..copied as usize])
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            return BOOL(1);
+        }
+
+        let map = &mut *(lparam.0 as *mut BTreeMap<String, RunningApp>);
+        map.entry(exe_lower)
+            .and_modify(|existing| {
+                if title.len() > existing.window_title.len() {
+                    existing.window_title = title.clone();
+                }
+            })
+            .or_insert(RunningApp {
+                exe_name,
+                window_title: title,
+            });
+
+        BOOL(1)
+    }
 }

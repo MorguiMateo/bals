@@ -114,10 +114,10 @@ impl fmt::Display for QualityPreset {
 /// Preferencia de encoder de video H.264.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EncoderPreference {
-    /// Automático: prioriza GPU por hardware (AMD AMF / NVIDIA NVENC / Intel QSV), con fallback a CPU.
+    /// Usa el encoder por Hardware de tu GPU (AMD AMF / NVIDIA NVENC / Intel QSV),
+    /// con fallback seguro a CPU si el driver falla al iniciar.
     #[default]
-    AutoGpu,
-    /// Usa exclusivamente el encoder por Hardware de tu GPU (AMD AMF / NVIDIA NVENC / Intel QSV).
+    #[serde(alias = "AutoGpu")]
     HardwareGpu,
     /// Usa el encoder H.264 por Software en CPU (útil para diagnóstico o bitrate CBR muy estricto).
     SoftwareCpu,
@@ -126,7 +126,6 @@ pub enum EncoderPreference {
 impl EncoderPreference {
     pub const fn label(self) -> &'static str {
         match self {
-            EncoderPreference::AutoGpu => "AUTO (GPU)",
             EncoderPreference::HardwareGpu => "GPU (HW)",
             EncoderPreference::SoftwareCpu => "CPU (SW)",
         }
@@ -165,7 +164,7 @@ impl VideoConfig {
         fps: FrameRate,
         quality: QualityPreset,
     ) -> Self {
-        Self::preset_full(resolution, fps, quality, EncoderPreference::AutoGpu)
+        Self::preset_full(resolution, fps, quality, EncoderPreference::HardwareGpu)
     }
 
     pub const fn preset_full(
@@ -387,7 +386,7 @@ impl Default for AppConfig {
             resolution: Resolution::P1080,
             fps: FrameRate::Fps60,
             quality: QualityPreset::Balanced,
-            encoder_pref: EncoderPreference::AutoGpu,
+            encoder_pref: EncoderPreference::HardwareGpu,
             replay_duration: ReplayDuration::Sec30,
             save_clip_hotkey: "\\".to_string(),
             capture_mode: CaptureMode::AutoDetectGames,
@@ -436,14 +435,32 @@ impl AppConfig {
         }
     }
 
+    /// Selecciona automáticamente el encoder más coherente según el hardware detectado
+    /// (GPU por hardware si está disponible; CPU software en caso contrario).
+    pub fn recommended_encoder_pref() -> EncoderPreference {
+        let detected = crate::encode::h264_mft::detect_system_encoders();
+        if detected.hw_name.is_some() {
+            EncoderPreference::HardwareGpu
+        } else {
+            EncoderPreference::SoftwareCpu
+        }
+    }
+
     pub fn load_or_create() -> Self {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|s| toml::from_str::<AppConfig>(&s).ok())
+                .and_then(|s| toml::from_str::<AppConfig>(&s).ok().map(|cfg| (s, cfg)))
             {
-                Some(cfg) => {
+                Some((raw, mut cfg)) => {
+                    // Migrar configuraciones heredadas que tenían `encoder_pref = "AutoGpu"` o sin campo.
+                    let is_legacy_auto = !raw.contains("encoder_pref")
+                        || raw.contains("\"AutoGpu\"")
+                        || raw.contains("'AutoGpu'");
+                    if is_legacy_auto {
+                        cfg.encoder_pref = Self::recommended_encoder_pref();
+                    }
                     info!(path = %path.display(), "Configuración cargada");
                     return cfg;
                 }
@@ -453,7 +470,8 @@ impl AppConfig {
             }
         }
 
-        let cfg = Self::default();
+        let mut cfg = Self::default();
+        cfg.encoder_pref = Self::recommended_encoder_pref();
         if let Err(err) = cfg.save() {
             warn!("No se pudo escribir config.toml inicial: {err:#}");
         }
@@ -513,5 +531,17 @@ mod tests {
         let cfg: AppConfig = toml::from_str(legacy_toml).expect("debería ignorar video_codec");
         assert_eq!(cfg.capture_mode, CaptureMode::ManualMonitor);
         assert_eq!(cfg.selected_monitor, None);
+    }
+
+    #[test]
+    fn migrates_legacy_auto_gpu_encoder_preference() {
+        let legacy_auto = r#"
+            encoder_pref = "AutoGpu"
+        "#;
+        let cfg: AppConfig = toml::from_str(legacy_auto).expect("debería aceptar alias AutoGpu");
+        assert_eq!(cfg.encoder_pref, EncoderPreference::HardwareGpu);
+
+        let sw_cfg: AppConfig = toml::from_str("encoder_pref = \"SoftwareCpu\"").unwrap();
+        assert_eq!(sw_cfg.encoder_pref, EncoderPreference::SoftwareCpu);
     }
 }

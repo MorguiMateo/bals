@@ -1,6 +1,6 @@
 [package]
 name = "bals"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 description = "Bals — Lightweight Windows game clipper built in Rust with zero-copy GPU capture and hardware encoding"
 
@@ -32,6 +32,7 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Networking_WinHttp",
     "Win32_System_Com",

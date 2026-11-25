@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -17,6 +18,9 @@ pub const WM_BALS_RELOAD_CONFIG: u32 = WM_APP + 10;
 pub const WM_BALS_TOGGLE_RECORD: u32 = WM_APP + 11;
 pub const WM_BALS_SAVE_CLIP: u32 = WM_APP + 12;
 pub const WM_BALS_SHUTDOWN: u32 = WM_APP + 13;
+pub const WM_BALS_CHECK_UPDATE: u32 = WM_APP + 14;
+pub const WM_BALS_PAUSE_HOTKEY: u32 = WM_APP + 15;
+pub const WM_BALS_RESUME_HOTKEY: u32 = WM_APP + 16;
 
 /// Estado compacto de grabación publicado por el daemon para el HUD de la UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +158,42 @@ pub fn notify_save_clip() -> bool {
 /// Solicita al daemon cerrarse ordenadamente (usado al aplicar una actualización automática).
 pub fn notify_shutdown() -> bool {
     post_to_daemon(WM_BALS_SHUTDOWN)
+}
+
+/// Solicita al daemon comprobar si hay una actualización disponible (al abrir la app).
+pub fn notify_check_update() -> bool {
+    post_to_daemon(WM_BALS_CHECK_UPDATE)
+}
+
+/// Pausa temporalmente la hotkey global mientras el usuario está asignando una tecla en la UI.
+pub fn notify_pause_hotkey() -> bool {
+    post_to_daemon(WM_BALS_PAUSE_HOTKEY)
+}
+
+/// Reanuda la hotkey global al terminar o cancelar la asignación de tecla en la UI.
+pub fn notify_resume_hotkey() -> bool {
+    post_to_daemon(WM_BALS_RESUME_HOTKEY)
+}
+
+/// Espera hasta que el daemon en segundo plano cierre su ventana de bandeja (o venza `timeout`).
+pub fn wait_until_daemon_stopped(timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !is_daemon_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !is_daemon_running()
+}
+
+/// Devuelve `true` si la ventana de interfaz (`bals.exe --ui`) está abierta actualmente.
+pub fn is_ui_open() -> bool {
+    let tray_hwnd = unsafe { FindWindowW(TRAY_WINDOW_CLASS, PCWSTR::null()) }.ok();
+    if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), UI_WINDOW_TITLE) } {
+        return !hwnd.is_invalid() && Some(hwnd) != tray_hwnd;
+    }
+    false
 }
 
 /// Cierra ordenadamente la ventana de escritorio (`bals.exe --ui`) si está abierta.
