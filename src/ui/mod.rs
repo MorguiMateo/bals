@@ -10,12 +10,16 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::audio::meter::AudioLevelMonitor;
 use crate::config::{
-    AppConfig, AudioCaptureMode, CaptureMode, FrameRate, ReplayDuration, Resolution, VideoConfig,
+    AppConfig, AudioCaptureMode, CaptureMode, FrameRate, QualityPreset, ReplayDuration, Resolution,
+    VideoConfig,
 };
 use crate::hotkey::parse_hotkey;
 use crate::ipc;
 use crate::startup;
-use crate::trimmer::{TrimStats, probe_mp4_duration_secs, suggested_trim_output, trim_mp4_passthrough};
+use crate::trimmer::{
+    TrimStats, compress_mp4_to_target_mb, probe_mp4_duration_secs, suggested_output_with_suffix,
+    suggested_trim_output, trim_mp4_passthrough,
+};
 use crate::updater::{self, CURRENT_VERSION, ReleaseInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +181,33 @@ impl BalsUiApp {
 
         std::thread::spawn(move || {
             let res = trim_mp4_passthrough(&input_path, &output_path, start, end);
+            if let Ok(mut st) = state_arc.lock() {
+                *st = match res {
+                    Ok(stats) => TrimState::Done(stats),
+                    Err(err) => TrimState::Error(format!("{err:#}")),
+                };
+            }
+        });
+    }
+
+    fn start_compress(&mut self, target_mb: f64, suffix: &'static str) {
+        let Some(input_path) = self.selected_clip.clone() else {
+            return;
+        };
+        let output_path = suggested_output_with_suffix(&input_path, suffix);
+        let start = self.trim_start;
+        let end = self.trim_end;
+        let state_arc = Arc::clone(&self.trim_state);
+
+        if let Ok(mut st) = state_arc.lock() {
+            if matches!(*st, TrimState::Running) {
+                return;
+            }
+            *st = TrimState::Running;
+        }
+
+        std::thread::spawn(move || {
+            let res = compress_mp4_to_target_mb(&input_path, &output_path, target_mb, start, end);
             if let Ok(mut st) = state_arc.lock() {
                 *st = match res {
                     Ok(stats) => TrimState::Done(stats),
@@ -402,6 +433,17 @@ impl BalsUiApp {
                 });
 
                 ui.horizontal(|ui| {
+                    ui.label("Calidad / Peso:");
+                    ui.selectable_value(
+                        &mut self.cfg.quality,
+                        QualityPreset::Compact,
+                        "Ahorro (-45% peso)",
+                    );
+                    ui.selectable_value(&mut self.cfg.quality, QualityPreset::Balanced, "Normal");
+                    ui.selectable_value(&mut self.cfg.quality, QualityPreset::High, "Alta");
+                });
+
+                ui.horizontal(|ui| {
                     ui.label("Duración del clip (Replay Buffer):");
                     ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec15, "15 s");
                     ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec30, "30 s");
@@ -409,12 +451,16 @@ impl BalsUiApp {
                     ui.selectable_value(&mut self.cfg.replay_duration, ReplayDuration::Sec120, "120 s");
                 });
 
-                let bitrate_bps = VideoConfig::recommended_bitrate(self.cfg.resolution, self.cfg.fps);
+                let bitrate_bps = VideoConfig::recommended_bitrate_for(
+                    self.cfg.resolution,
+                    self.cfg.fps,
+                    self.cfg.quality,
+                );
                 let est_ram_mb = (bitrate_bps as f64 / 8.0) * self.cfg.replay_duration.as_secs() as f64
                     / (1024.0 * 1024.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "Bitrate objetivo: {:.0} Mbps · RAM estimada del buffer: ~{:.1} MB · Uso de disco mientras juegas: 0 MB/s",
+                        "Bitrate objetivo: {:.1} Mbps · RAM estimada del buffer: ~{:.1} MB · Uso de disco mientras juegas: 0 MB/s",
                         bitrate_bps as f64 / 1_000_000.0,
                         est_ram_mb
                     ))
@@ -769,14 +815,30 @@ impl BalsUiApp {
 
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!trim_in_progress, |ui| {
-                    let label = if trim_in_progress {
-                        "Recortando..."
-                    } else {
-                        "✂ Recortar y guardar copia"
-                    };
-                    if ui.button(label).clicked() {
-                        self.start_trim();
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let trim_label = if trim_in_progress {
+                            "Procesando..."
+                        } else {
+                            "✂ Recortar sin pérdida"
+                        };
+                        if ui.button(trim_label).clicked() {
+                            self.start_trim();
+                        }
+                        if ui
+                            .button("📦 Comprimir <10 MB (Discord)")
+                            .on_hover_text("Recodifica el rango seleccionado usando tu GPU para quedar por debajo de 10 MB")
+                            .clicked()
+                        {
+                            self.start_compress(9.5, "discord");
+                        }
+                        if ui
+                            .button("📦 Comprimir <25 MB")
+                            .on_hover_text("Recodifica el rango seleccionado usando tu GPU para quedar por debajo de 25 MB")
+                            .clicked()
+                        {
+                            self.start_compress(24.0, "25mb");
+                        }
+                    });
                 });
             });
         });

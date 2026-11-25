@@ -24,7 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-use crate::config::{AppConfig, AudioCaptureMode, CaptureMode, FrameRate, ReplayDuration, Resolution};
+use crate::config::{
+    AppConfig, AudioCaptureMode, CaptureMode, FrameRate, QualityPreset, ReplayDuration, Resolution,
+};
 use crate::engine::{EngineCommand, EngineEvent, EngineStatus, RecordingState};
 use crate::hotkey::parse_hotkey;
 use crate::ipc::{
@@ -47,6 +49,9 @@ const IDM_RES_1080: usize = 1011;
 const IDM_RES_1440: usize = 1012;
 const IDM_FPS_30: usize = 1020;
 const IDM_FPS_60: usize = 1021;
+const IDM_QUAL_COMPACT: usize = 1025;
+const IDM_QUAL_BALANCED: usize = 1026;
+const IDM_QUAL_HIGH: usize = 1027;
 const IDM_DUR_15: usize = 1030;
 const IDM_DUR_30: usize = 1031;
 const IDM_DUR_60: usize = 1032;
@@ -369,6 +374,18 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
                 st.cfg.fps = FrameRate::Fps60;
                 config_changed = true;
             }
+            IDM_QUAL_COMPACT => {
+                st.cfg.quality = QualityPreset::Compact;
+                config_changed = true;
+            }
+            IDM_QUAL_BALANCED => {
+                st.cfg.quality = QualityPreset::Balanced;
+                config_changed = true;
+            }
+            IDM_QUAL_HIGH => {
+                st.cfg.quality = QualityPreset::High;
+                config_changed = true;
+            }
             IDM_DUR_15 => {
                 st.cfg.replay_duration = ReplayDuration::Sec15;
                 config_changed = true;
@@ -530,6 +547,30 @@ fn show_context_menu(hwnd: HWND) {
                 append_checked(sub_fps, st.cfg.fps == FrameRate::Fps60, IDM_FPS_60, "60 fps");
                 let label = HSTRING::from(format!("Cuadros ({})", st.cfg.fps));
                 let _ = AppendMenuW(menu, MF_POPUP, sub_fps.0 as usize, &label);
+            }
+
+            // Submenú Calidad / Peso
+            if let Ok(sub_q) = CreatePopupMenu() {
+                append_checked(
+                    sub_q,
+                    st.cfg.quality == QualityPreset::Compact,
+                    IDM_QUAL_COMPACT,
+                    "Ahorro (~45% menos peso)",
+                );
+                append_checked(
+                    sub_q,
+                    st.cfg.quality == QualityPreset::Balanced,
+                    IDM_QUAL_BALANCED,
+                    "Normal (Recomendado)",
+                );
+                append_checked(
+                    sub_q,
+                    st.cfg.quality == QualityPreset::High,
+                    IDM_QUAL_HIGH,
+                    "Alta (Máxima nitidez)",
+                );
+                let label = HSTRING::from(format!("Calidad ({})", st.cfg.quality));
+                let _ = AppendMenuW(menu, MF_POPUP, sub_q.0 as usize, &label);
             }
 
             // Submenú Duración

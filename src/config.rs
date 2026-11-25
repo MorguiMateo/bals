@@ -80,6 +80,37 @@ impl fmt::Display for FrameRate {
     }
 }
 
+/// Perfil de calidad/compresión para controlar tamaño de clips y RAM del buffer (0% CPU extra).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QualityPreset {
+    /// ~45% menos peso y RAM (ideal para compartir fácil o PCs con poca RAM/disco).
+    Compact,
+    /// Equilibrio óptimo entre nitidez y peso.
+    Balanced,
+    /// Máxima nitidez (~40% más bitrate).
+    High,
+}
+
+impl QualityPreset {
+    pub const fn bitrate_scale_pct(self) -> u32 {
+        match self {
+            QualityPreset::Compact => 55,
+            QualityPreset::Balanced => 100,
+            QualityPreset::High => 140,
+        }
+    }
+}
+
+impl fmt::Display for QualityPreset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QualityPreset::Compact => write!(f, "Ahorro"),
+            QualityPreset::Balanced => write!(f, "Normal"),
+            QualityPreset::High => write!(f, "Alta"),
+        }
+    }
+}
+
 /// Configuración de video del encoder H.264.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoConfig {
@@ -93,7 +124,15 @@ pub struct VideoConfig {
 
 impl VideoConfig {
     pub const fn preset(resolution: Resolution, fps: FrameRate) -> Self {
-        let bitrate_bps = Self::recommended_bitrate(resolution, fps);
+        Self::preset_with_quality(resolution, fps, QualityPreset::Balanced)
+    }
+
+    pub const fn preset_with_quality(
+        resolution: Resolution,
+        fps: FrameRate,
+        quality: QualityPreset,
+    ) -> Self {
+        let bitrate_bps = Self::recommended_bitrate_for(resolution, fps, quality);
         Self {
             resolution,
             fps,
@@ -112,6 +151,15 @@ impl VideoConfig {
             (Resolution::P1440, FrameRate::Fps30) => 12_000_000, // 12 Mbps (~45 MB / 30s)
             (Resolution::P1440, FrameRate::Fps60) => 18_000_000, // 18 Mbps (~67.5 MB / 30s)
         }
+    }
+
+    pub const fn recommended_bitrate_for(
+        resolution: Resolution,
+        fps: FrameRate,
+        quality: QualityPreset,
+    ) -> u32 {
+        let base = Self::recommended_bitrate(resolution, fps) as u64;
+        ((base * quality.bitrate_scale_pct() as u64) / 100) as u32
     }
 
     pub const fn gop_frames(&self) -> u32 {
@@ -214,6 +262,7 @@ pub enum AudioCaptureMode {
 pub struct AppConfig {
     pub resolution: Resolution,
     pub fps: FrameRate,
+    pub quality: QualityPreset,
     pub replay_duration: ReplayDuration,
     /// Atajo global para guardar los últimos N segundos (por defecto `\`).
     pub save_clip_hotkey: String,
@@ -238,6 +287,7 @@ impl Default for AppConfig {
         Self {
             resolution: Resolution::P1080,
             fps: FrameRate::Fps60,
+            quality: QualityPreset::Balanced,
             replay_duration: ReplayDuration::Sec30,
             save_clip_hotkey: "\\".to_string(),
             capture_mode: CaptureMode::AutoDetectGames,
@@ -257,7 +307,7 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn video_config(&self) -> VideoConfig {
-        VideoConfig::preset(self.resolution, self.fps)
+        VideoConfig::preset_with_quality(self.resolution, self.fps, self.quality)
     }
 
     pub fn audio_config(&self, source: AudioSource) -> AudioConfig {
